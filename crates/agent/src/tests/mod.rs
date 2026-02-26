@@ -9,7 +9,7 @@ use anyhow::Result;
 use client::{Client, UserStore};
 use collections::IndexMap;
 use context_server::{ContextServer, ContextServerCommand, ContextServerId};
-use feature_flags::FeatureFlagAppExt as _;
+
 use fs::{FakeFs, Fs};
 use futures::{
     FutureExt as _, StreamExt,
@@ -4563,10 +4563,6 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
-
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
         "/",
@@ -4698,10 +4694,6 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
-
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
         "/",
@@ -4846,10 +4838,6 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
-
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
         "/",
@@ -4976,10 +4964,6 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
-
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
         "/",
@@ -5154,10 +5138,6 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
 async fn test_subagent_tool_is_present_when_feature_flag_enabled(cx: &mut TestAppContext) {
     init_test(cx);
 
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
-
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(path!("/test"), json!({})).await;
     let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
@@ -5195,10 +5175,6 @@ async fn test_subagent_tool_is_present_when_feature_flag_enabled(cx: &mut TestAp
 #[gpui::test]
 async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestAppContext) {
     init_test(cx);
-
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(path!("/test"), json!({})).await;
@@ -5243,10 +5219,6 @@ async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestApp
 #[gpui::test]
 async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppContext) {
     init_test(cx);
-
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(path!("/test"), json!({})).await;
@@ -5293,10 +5265,6 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
 #[gpui::test]
 async fn test_parent_cancel_stops_subagent(cx: &mut TestAppContext) {
     init_test(cx);
-
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(path!("/test"), json!({})).await;
@@ -5353,10 +5321,6 @@ async fn test_subagent_context_window_warning(cx: &mut TestAppContext) {
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
-
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
         "/",
@@ -5479,10 +5443,6 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
-
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
         "/",
@@ -5653,10 +5613,6 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
     cx.update(|cx| {
         LanguageModelRegistry::test(cx);
     });
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
-
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
         "/",

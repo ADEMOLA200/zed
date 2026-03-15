@@ -74,6 +74,7 @@ impl ViewExample {
 impl Render for ViewExample {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_log = window.use_state(cx, |_window, cx| RenderLog::new(cx));
+        render_log.update(cx, |log, _cx| log.begin_frame());
         let input_state = window.use_state(cx, {
             let render_log = render_log.clone();
             move |window, cx| ExampleInputState::new(render_log, window, cx)

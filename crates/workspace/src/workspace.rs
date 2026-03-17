@@ -1393,19 +1393,19 @@ impl Workspace {
                 }
             })
             .detach();
-
-            cx.observe_global_in::<SettingsStore>(window, |this, window, cx| {
-                if ProjectSettings::get_global(cx).session.trust_all_worktrees {
-                    if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
-                        trusted_worktrees.update(cx, |trusted_worktrees, cx| {
-                            trusted_worktrees.auto_trust_all(cx);
-                        })
-                    }
-                }
-                this.reposition_panels(window, cx);
-            })
-            .detach();
         }
+
+        cx.observe_global_in::<SettingsStore>(window, |this, window, cx| {
+            if ProjectSettings::get_global(cx).session.trust_all_worktrees {
+                if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
+                    trusted_worktrees.update(cx, |trusted_worktrees, cx| {
+                        trusted_worktrees.auto_trust_all(cx);
+                    })
+                }
+            }
+            this.reposition_panels(window, cx);
+        })
+        .detach();
 
         cx.subscribe_in(&project, window, move |this, _, event, window, cx| {
             match event {

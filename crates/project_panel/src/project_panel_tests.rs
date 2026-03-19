@@ -1995,7 +1995,7 @@ async fn test_copy_paste_nested_and_root_entries(cx: &mut gpui::TestAppContext) 
 }
 
 #[gpui::test]
-async fn test_undo_rename(cx: &mut gpui::TestAppContext) {
+async fn test_undo_redo_rename(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
@@ -2053,6 +2053,21 @@ async fn test_undo_rename(cx: &mut gpui::TestAppContext) {
         find_project_entry(&panel, "root/renamed.txt", cx),
         None,
         "Renamed file should no longer exist after undo"
+    );
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.redo(&Redo, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        find_project_entry(&panel, "root/renamed.txt", cx).is_some(),
+        "File should be renamed to renamed.txt after redo"
+    );
+    assert_eq!(
+        find_project_entry(&panel, "root/a.txt", cx),
+        None,
+        "Original file should no longer exist after redo"
     );
 }
 

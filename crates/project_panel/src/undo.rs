@@ -80,7 +80,12 @@ impl UndoManager {
                             .map(|err| SharedString::from(err.to_string()))
                             .collect();
 
-                        Self::show_errors(workspace, messages, cx)
+                        Self::show_errors(
+                            "Failed to undo Project Panel Operation(s)",
+                            workspace,
+                            messages,
+                            cx,
+                        )
                     })
                 }
             })
@@ -88,16 +93,50 @@ impl UndoManager {
         }
     }
 
-    pub fn redo(&mut self, _cx: &mut App) {
+    pub fn redo(&mut self, cx: &mut App) {
         if self.cursor >= self.history.len() {
             return;
         }
 
-        if let Some(_operation) = self.history.get(self.cursor) {
-            // TODO!: Implement actual operation redo.
+        if let Some(operation) = self.history.get(self.cursor) {
+            let task = self.redo_operation(operation, cx);
+            let workspace = self.workspace.clone();
+
+            cx.spawn(async move |cx| {
+                let errors = task.await;
+                if !errors.is_empty() {
+                    cx.update(|cx| {
+                        let messages = errors
+                            .iter()
+                            .map(|err| SharedString::from(err.to_string()))
+                            .collect();
+
+                        Self::show_errors(
+                            "Failed to redo Project Panel Operation(s)",
+                            workspace,
+                            messages,
+                            cx,
+                        )
+                    })
+                }
+            })
+            .detach();
         }
 
         self.cursor += 1;
+    }
+
+    fn redo_operation(
+        &self,
+        operation: &ProjectPanelOperation,
+        cx: &mut App,
+    ) -> Task<Vec<anyhow::Error>> {
+        match operation {
+            ProjectPanelOperation::Rename { old_path, new_path } => {
+                self.rename(old_path, new_path, cx)
+            }
+            _ => Task::ready(vec![anyhow!("Not implemented.")]),
+        }
     }
 
     pub fn record(&mut self, operation: ProjectPanelOperation) {
@@ -172,30 +211,7 @@ impl UndoManager {
                 })
             }
             ProjectPanelOperation::Rename { old_path, new_path } => {
-                let Some(workspace) = self.workspace.upgrade() else {
-                    return Task::ready(vec![anyhow!("Failed to obtain workspace.")]);
-                };
-
-                let result = workspace.update(cx, |workspace, cx| {
-                    workspace.project().update(cx, |project, cx| {
-                        let entry_id = project
-                            .entry_for_path(&new_path, cx)
-                            .map(|entry| entry.id)
-                            .ok_or_else(|| anyhow!("No entry for path."))?;
-
-                        Ok(project.rename_entry(entry_id, old_path.clone(), cx))
-                    })
-                });
-
-                let task = match result {
-                    Ok(task) => task,
-                    Err(err) => return Task::ready(vec![err]),
-                };
-
-                cx.spawn(async move |_| match task.await {
-                    Ok(_) => vec![],
-                    Err(err) => vec![err],
-                })
+                self.rename(new_path, old_path, cx)
             }
             ProjectPanelOperation::Batch(operations) => {
                 // When reverting operations in a batch, we reverse the order of
@@ -226,11 +242,48 @@ impl UndoManager {
         }
     }
 
+    fn rename(
+        &self,
+        from: &ProjectPath,
+        to: &ProjectPath,
+        cx: &mut App,
+    ) -> Task<Vec<anyhow::Error>> {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Task::ready(vec![anyhow!("Failed to obtain workspace.")]);
+        };
+
+        let result = workspace.update(cx, |workspace, cx| {
+            workspace.project().update(cx, |project, cx| {
+                let entry_id = project
+                    .entry_for_path(from, cx)
+                    .map(|entry| entry.id)
+                    .ok_or_else(|| anyhow!("No entry for path."))?;
+
+                Ok(project.rename_entry(entry_id, to.clone(), cx))
+            })
+        });
+
+        let task = match result {
+            Ok(task) => task,
+            Err(err) => return Task::ready(vec![err]),
+        };
+
+        cx.spawn(async move |_| match task.await {
+            Ok(_) => vec![],
+            Err(err) => vec![err],
+        })
+    }
+
     /// Displays a notification with the list of provided errors ensuring that,
     /// when more than one error is provided, which can be the case when dealing
     /// with undoing a [`crate::undo::ProjectPanelOperation::Batch`], a list is
     /// displayed with each of the errors, instead of a single message.
-    fn show_errors(workspace: WeakEntity<Workspace>, messages: Vec<SharedString>, cx: &mut App) {
+    fn show_errors(
+        title: impl Into<SharedString>,
+        workspace: WeakEntity<Workspace>,
+        messages: Vec<SharedString>,
+        cx: &mut App,
+    ) {
         workspace
             .update(cx, move |workspace, cx| {
                 let notification_id =
@@ -239,8 +292,7 @@ impl UndoManager {
                 workspace.show_notification(notification_id, cx, move |cx| {
                     cx.new(|cx| {
                         if let [err] = messages.as_slice() {
-                            MessageNotification::new(err.to_string(), cx)
-                                .with_title("Failed to undo Project Panel Operation")
+                            MessageNotification::new(err.to_string(), cx).with_title(title)
                         } else {
                             MessageNotification::new_from_builder(cx, move |_, _| {
                                 v_flex()
@@ -252,7 +304,7 @@ impl UndoManager {
                                     )
                                     .into_any_element()
                             })
-                            .with_title("Failed to undo Project Panel Operations")
+                            .with_title(title)
                         }
                     })
                 })

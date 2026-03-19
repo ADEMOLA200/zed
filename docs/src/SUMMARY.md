@@ -75,9 +75,9 @@
 - [Overview](./ai/privacy-and-security.md)
   - [Worktree Trust](./worktree-trust.md)
   - [AI Improvement](./ai/ai-improvement.md)
-- [Privacy for Business]()
+- [Privacy for Business](./business/privacy.md)
 - [Telemetry](./telemetry.md)
-- [SOC2]()
+- [SOC2](./soc2.md)
 
 # Platform Support
 

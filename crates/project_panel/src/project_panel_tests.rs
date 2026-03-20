@@ -1,4 +1,5 @@
 use super::*;
+use crate::undo::test::{build_create_operation, build_rename_operation};
 use collections::HashSet;
 use editor::MultiBufferOffset;
 use gpui::{Empty, Entity, TestAppContext, VisualTestContext};
@@ -1995,7 +1996,7 @@ async fn test_copy_paste_nested_and_root_entries(cx: &mut gpui::TestAppContext) 
 }
 
 #[gpui::test]
-async fn test_undo_rename(cx: &mut gpui::TestAppContext) {
+async fn test_undo_redo_rename(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
@@ -2053,6 +2054,21 @@ async fn test_undo_rename(cx: &mut gpui::TestAppContext) {
         find_project_entry(&panel, "root/renamed.txt", cx),
         None,
         "Renamed file should no longer exist after undo"
+    );
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.redo(&Redo, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        find_project_entry(&panel, "root/renamed.txt", cx).is_some(),
+        "File should be renamed to renamed.txt after redo"
+    );
+    assert_eq!(
+        find_project_entry(&panel, "root/a.txt", cx),
+        None,
+        "Original file should no longer exist after redo"
     );
 }
 
@@ -2504,18 +2520,8 @@ async fn test_undo_batch(cx: &mut gpui::TestAppContext) {
     // being provided in the operations.
     panel.update(cx, |panel, _cx| {
         panel.undo_manager.record_batch(vec![
-            ProjectPanelOperation::Create {
-                project_path: ProjectPath {
-                    worktree_id,
-                    path: Arc::from(rel_path("src/main.rs")),
-                },
-            },
-            ProjectPanelOperation::Create {
-                project_path: ProjectPath {
-                    worktree_id,
-                    path: Arc::from(rel_path("src/")),
-                },
-            },
+            build_create_operation(worktree_id, "src/main.rs"),
+            build_create_operation(worktree_id, "src/"),
         ]);
     });
 
@@ -2540,6 +2546,81 @@ async fn test_undo_batch(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         fs.directories(false),
         vec![PathBuf::from(path!("/")), PathBuf::from(path!("/root/"))]
+    );
+}
+
+#[gpui::test]
+async fn test_redo_batch(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "file_c.txt": "",
+            "file_d.txt": "",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    let worktree_id = project.update(cx, |project, cx| {
+        project.visible_worktrees(cx).next().unwrap().read(cx).id()
+    });
+    cx.run_until_parked();
+
+    // At the time of writing, only the `ProjectPanelOperation::Rename`
+    // operation supports redoing. As such, that's what we'll use in the batch
+    // operation, to ensure that undoing and redoing a batch operation works as
+    // expected.
+    panel.update(cx, |panel, _cx| {
+        panel.undo_manager.record_batch(vec![
+            build_rename_operation(worktree_id, "file_a.txt", "file_c.txt"),
+            build_rename_operation(worktree_id, "file_b.txt", "file_d.txt"),
+        ]);
+    });
+
+    // Before proceeding, ensure that both `file_c.txt` as well as `file_d.txt`
+    // exist in the filesystem, so we can later ensure that undoing renames
+    // these files and redoing renames again to how the test started.
+    assert_eq!(
+        fs.files(),
+        vec![
+            PathBuf::from(path!("/root/file_c.txt")),
+            PathBuf::from(path!("/root/file_d.txt"))
+        ]
+    );
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.undo(&Undo, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        fs.files(),
+        vec![
+            PathBuf::from(path!("/root/file_a.txt")),
+            PathBuf::from(path!("/root/file_b.txt"))
+        ]
+    );
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.redo(&Redo, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        fs.files(),
+        vec![
+            PathBuf::from(path!("/root/file_c.txt")),
+            PathBuf::from(path!("/root/file_d.txt"))
+        ]
     );
 }
 

@@ -401,6 +401,8 @@ actions!(
         CompareMarkedFiles,
         /// Undoes the last file operation.
         Undo,
+        /// Redoes the last undone file operation.
+        Redo,
     ]
 );
 
@@ -1242,6 +1244,11 @@ impl ProjectPanel {
                                     !self.undo_manager.can_undo(),
                                     "Undo",
                                     Box::new(Undo),
+                                )
+                                .action_disabled_when(
+                                    !self.undo_manager.can_redo(),
+                                    "Redo",
+                                    Box::new(Redo),
                                 )
                             })
                             .when(is_remote, |menu| {
@@ -2205,6 +2212,11 @@ impl ProjectPanel {
 
     pub fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
         self.undo_manager.undo(cx);
+        cx.notify();
+    }
+
+    pub fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        self.undo_manager.redo(cx);
         cx.notify();
     }
 
@@ -6684,6 +6696,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::compare_marked_files))
                 .when(cx.has_flag::<ProjectPanelUndoRedoFeatureFlag>(), |el| {
                     el.on_action(cx.listener(Self::undo))
+                        .on_action(cx.listener(Self::redo))
                 })
                 .when(!project.is_read_only(cx), |el| {
                     el.on_action(cx.listener(Self::new_file))

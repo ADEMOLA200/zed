@@ -693,6 +693,7 @@ async fn test_fake_fs_trash_dir(executor: BackgroundExecutor) {
     assert_eq!(trash_entries[0].original_parent, root_path);
 }
 
+#[gpui::test]
 #[ignore = "stress test; run explicitly when needed"]
 async fn test_realfs_watch_stress_reports_missed_paths(
     executor: BackgroundExecutor,

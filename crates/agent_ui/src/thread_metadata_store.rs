@@ -224,6 +224,10 @@ impl SidebarThreadMetadataStore {
         self.threads.iter().cloned()
     }
 
+    pub fn all_entries(&self) -> &[ThreadMetadata] {
+        &self.threads
+    }
+
     pub fn entry_ids(&self) -> impl Iterator<Item = acp::SessionId> + '_ {
         self.threads.iter().map(|thread| thread.session_id.clone())
     }

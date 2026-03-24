@@ -280,15 +280,10 @@ impl ActionLog {
         event: &BufferEvent,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some((_, expected_external_edit)) =
-            self.tracked_buffers
-                .get(&buffer)
-                .and_then(|tracked_buffer| {
-                    tracked_buffer
-                        .expected_external_edit
-                        .clone()
-                        .map(|expected_external_edit| (tracked_buffer.mode, expected_external_edit))
-                })
+        let Some(expected_external_edit) = self
+            .tracked_buffers
+            .get(&buffer)
+            .and_then(|tracked_buffer| tracked_buffer.expected_external_edit.clone())
         else {
             return false;
         };
@@ -299,7 +294,8 @@ impl ActionLog {
 
         match event {
             BufferEvent::Saved
-                if expected_external_edit.observed_external_file_change
+                if (expected_external_edit.observed_external_file_change
+                    || expected_external_edit.armed_explicit_reload)
                     && !expected_external_edit.has_attributed_change =>
             {
                 self.mark_expected_external_edit_disqualified(&buffer);
@@ -322,7 +318,11 @@ impl ActionLog {
                     }
                 }
 
+                // Reload applies its text changes through ordinary local edit events before
+                // emitting `Reloaded`, so an explicitly armed reload must suppress those edits
+                // to preserve the pre-reload baseline for attribution.
                 expected_external_edit.observed_external_file_change
+                    || expected_external_edit.armed_explicit_reload
             }
             BufferEvent::FileHandleChanged => {
                 let (is_deleted, is_empty, is_dirty) = buffer.read_with(cx, |buffer, _| {
@@ -341,7 +341,14 @@ impl ActionLog {
                     {
                         if !is_dirty || is_deleted {
                             expected_external_edit.observed_external_file_change = true;
+                            expected_external_edit.armed_explicit_reload = false;
                         }
+                        // Non-delete external changes against dirty buffers stay unsupported for now.
+                        // We do not mark them as observed here, so they are not automatically
+                        // remembered for attribution once the buffer becomes clean. Later
+                        // attribution only happens after a subsequent clean file change or an
+                        // explicitly armed reload, which keeps conflicted reloads and local-save
+                        // noise from becoming agent edits.
                         expected_external_edit.pending_delete = is_deleted;
                     }
                 }
@@ -360,7 +367,8 @@ impl ActionLog {
                 true
             }
             BufferEvent::Reloaded
-                if expected_external_edit.observed_external_file_change
+                if (expected_external_edit.observed_external_file_change
+                    || expected_external_edit.armed_explicit_reload)
                     && !expected_external_edit.pending_delete =>
             {
                 if self.expected_external_edit_has_meaningful_change(&buffer, cx) {
@@ -370,6 +378,7 @@ impl ActionLog {
                         tracked_buffer.expected_external_edit.as_mut()
                     {
                         expected_external_edit.observed_external_file_change = false;
+                        expected_external_edit.armed_explicit_reload = false;
                         expected_external_edit.pending_delete = false;
                     }
                 }
@@ -390,6 +399,7 @@ impl ActionLog {
 
         expected_external_edit.is_disqualified = true;
         expected_external_edit.observed_external_file_change = false;
+        expected_external_edit.armed_explicit_reload = false;
         expected_external_edit.pending_delete = false;
     }
 
@@ -454,6 +464,7 @@ impl ActionLog {
 
         expected_external_edit.has_attributed_change = true;
         expected_external_edit.observed_external_file_change = false;
+        expected_external_edit.armed_explicit_reload = false;
         expected_external_edit.pending_delete = false;
         tracked_buffer.mode = TrackedBufferMode::Normal;
 
@@ -506,6 +517,7 @@ impl ActionLog {
 
         expected_external_edit.has_attributed_change = true;
         expected_external_edit.observed_external_file_change = false;
+        expected_external_edit.armed_explicit_reload = false;
         expected_external_edit.pending_delete = false;
         tracked_buffer.mode = TrackedBufferMode::Normal;
         tracked_buffer.status = TrackedBufferStatus::Deleted;
@@ -932,6 +944,7 @@ impl ActionLog {
                     record_file_read_time_source_count: 0,
                     initial_exists_on_disk,
                     observed_external_file_change: false,
+                    armed_explicit_reload: false,
                     has_attributed_change,
                     pending_delete: false,
                     is_disqualified: false,
@@ -940,6 +953,39 @@ impl ActionLog {
         if record_file_read_time {
             expected_external_edit.record_file_read_time_source_count += 1;
         }
+    }
+
+    pub fn arm_expected_external_reload(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        self.arm_expected_external_reload_impl(buffer, true, cx);
+    }
+
+    fn arm_expected_external_reload_impl(
+        &mut self,
+        buffer: Entity<Buffer>,
+        forward_to_linked_action_log: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if forward_to_linked_action_log {
+            if let Some(linked_action_log) = &self.linked_action_log {
+                linked_action_log.update(cx, |log, cx| {
+                    log.arm_expected_external_reload_impl(buffer.clone(), false, cx);
+                });
+            }
+        }
+
+        let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
+            return;
+        };
+        let Some(expected_external_edit) = tracked_buffer.expected_external_edit.as_mut() else {
+            return;
+        };
+        if expected_external_edit.is_disqualified || expected_external_edit.pending_delete {
+            return;
+        }
+
+        // Explicit reloads can observe on-disk contents before the worktree has delivered
+        // `FileHandleChanged`, so we arm the next reload for attribution ahead of time.
+        expected_external_edit.armed_explicit_reload = true;
     }
 
     pub fn end_expected_external_edit(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
@@ -1000,45 +1046,13 @@ impl ActionLog {
         baseline_snapshot: text::BufferSnapshot,
         cx: &mut Context<Self>,
     ) {
-        self.infer_buffer_created_impl(buffer, baseline_snapshot, true, cx);
-    }
-
-    fn infer_buffer_created_impl(
-        &mut self,
-        buffer: Entity<Buffer>,
-        baseline_snapshot: text::BufferSnapshot,
-        record_file_read_time: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(linked_action_log) = &self.linked_action_log {
-            let linked_baseline_snapshot = baseline_snapshot.clone();
-            if !linked_action_log.read(cx).has_changed_buffer(&buffer, cx) {
-                linked_action_log.update(cx, |log, cx| {
-                    log.infer_buffer_created_impl(
-                        buffer.clone(),
-                        linked_baseline_snapshot,
-                        false,
-                        cx,
-                    );
-                });
-            }
-        }
-
-        if record_file_read_time {
-            self.update_file_read_time(&buffer, cx);
-        }
-        self.prime_tracked_buffer_from_snapshot(
-            buffer.clone(),
+        self.infer_buffer_from_snapshot_impl(
+            buffer,
             baseline_snapshot,
-            TrackedBufferStatus::Created {
-                existing_file_content: None,
-            },
+            InferredSnapshotKind::Created,
+            true,
             cx,
         );
-
-        if let Some(tracked_buffer) = self.tracked_buffers.get(&buffer) {
-            tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
-        }
     }
 
     pub fn infer_buffer_edited_from_snapshot(
@@ -1047,43 +1061,13 @@ impl ActionLog {
         baseline_snapshot: text::BufferSnapshot,
         cx: &mut Context<Self>,
     ) {
-        self.infer_buffer_edited_from_snapshot_impl(buffer, baseline_snapshot, true, cx);
-    }
-
-    fn infer_buffer_edited_from_snapshot_impl(
-        &mut self,
-        buffer: Entity<Buffer>,
-        baseline_snapshot: text::BufferSnapshot,
-        record_file_read_time: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(linked_action_log) = &self.linked_action_log {
-            let linked_baseline_snapshot = baseline_snapshot.clone();
-            if !linked_action_log.read(cx).has_changed_buffer(&buffer, cx) {
-                linked_action_log.update(cx, |log, cx| {
-                    log.infer_buffer_edited_from_snapshot_impl(
-                        buffer.clone(),
-                        linked_baseline_snapshot,
-                        false,
-                        cx,
-                    );
-                });
-            }
-        }
-
-        if record_file_read_time {
-            self.update_file_read_time(&buffer, cx);
-        }
-        self.prime_tracked_buffer_from_snapshot(
-            buffer.clone(),
+        self.infer_buffer_from_snapshot_impl(
+            buffer,
             baseline_snapshot,
-            TrackedBufferStatus::Modified,
+            InferredSnapshotKind::Edited,
+            true,
             cx,
         );
-
-        if let Some(tracked_buffer) = self.tracked_buffers.get(&buffer) {
-            tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
-        }
     }
 
     pub fn infer_buffer_deleted_from_snapshot(
@@ -1092,47 +1076,74 @@ impl ActionLog {
         baseline_snapshot: text::BufferSnapshot,
         cx: &mut Context<Self>,
     ) {
-        self.infer_buffer_deleted_from_snapshot_impl(buffer, baseline_snapshot, true, cx);
+        self.infer_buffer_from_snapshot_impl(
+            buffer,
+            baseline_snapshot,
+            InferredSnapshotKind::Deleted,
+            true,
+            cx,
+        );
     }
 
-    fn infer_buffer_deleted_from_snapshot_impl(
+    fn forward_inferred_snapshot_to_linked_action_log(
         &mut self,
-        buffer: Entity<Buffer>,
-        baseline_snapshot: text::BufferSnapshot,
-        record_file_read_time: bool,
+        buffer: &Entity<Buffer>,
+        baseline_snapshot: &text::BufferSnapshot,
+        kind: InferredSnapshotKind,
         cx: &mut Context<Self>,
     ) {
         if let Some(linked_action_log) = &self.linked_action_log {
             let linked_baseline_snapshot = baseline_snapshot.clone();
-            if !linked_action_log.read(cx).has_changed_buffer(&buffer, cx) {
+            if !linked_action_log.read(cx).has_changed_buffer(buffer, cx) {
                 linked_action_log.update(cx, |log, cx| {
-                    log.infer_buffer_deleted_from_snapshot_impl(
+                    log.infer_buffer_from_snapshot_impl(
                         buffer.clone(),
                         linked_baseline_snapshot,
+                        kind,
                         false,
                         cx,
                     );
                 });
             }
         }
+    }
+
+    fn infer_buffer_from_snapshot_impl(
+        &mut self,
+        buffer: Entity<Buffer>,
+        baseline_snapshot: text::BufferSnapshot,
+        kind: InferredSnapshotKind,
+        record_file_read_time: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.forward_inferred_snapshot_to_linked_action_log(&buffer, &baseline_snapshot, kind, cx);
 
         if record_file_read_time {
-            self.remove_file_read_time(&buffer, cx);
+            match kind {
+                InferredSnapshotKind::Created | InferredSnapshotKind::Edited => {
+                    self.update_file_read_time(&buffer, cx);
+                }
+                InferredSnapshotKind::Deleted => {
+                    self.remove_file_read_time(&buffer, cx);
+                }
+            }
         }
-        let has_linked_action_log = self.linked_action_log.is_some();
+
         self.prime_tracked_buffer_from_snapshot(
             buffer.clone(),
             baseline_snapshot,
-            TrackedBufferStatus::Deleted,
+            kind.tracked_buffer_status(),
             cx,
         );
 
-        if !has_linked_action_log {
+        if kind == InferredSnapshotKind::Deleted && self.linked_action_log.is_none() {
             buffer.update(cx, |buffer, cx| buffer.set_text("", cx));
         }
 
         if let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) {
-            tracked_buffer.version = buffer.read(cx).version();
+            if kind == InferredSnapshotKind::Deleted {
+                tracked_buffer.version = buffer.read(cx).version();
+            }
             tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
         }
     }
@@ -1800,6 +1811,25 @@ enum ChangeAuthor {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum InferredSnapshotKind {
+    Created,
+    Edited,
+    Deleted,
+}
+
+impl InferredSnapshotKind {
+    fn tracked_buffer_status(self) -> TrackedBufferStatus {
+        match self {
+            Self::Created => TrackedBufferStatus::Created {
+                existing_file_content: None,
+            },
+            Self::Edited => TrackedBufferStatus::Modified,
+            Self::Deleted => TrackedBufferStatus::Deleted,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum TrackedBufferMode {
     Normal,
     ExpectationOnly,
@@ -1811,6 +1841,7 @@ struct ExpectedExternalEdit {
     record_file_read_time_source_count: usize,
     initial_exists_on_disk: bool,
     observed_external_file_change: bool,
+    armed_explicit_reload: bool,
     has_attributed_change: bool,
     pending_delete: bool,
     is_disqualified: bool,
@@ -4280,6 +4311,117 @@ mod tests {
         assert_eq!(
             String::from_utf8(fs.read_file_sync(path!("/dir/file")).unwrap()).unwrap(),
             "zero\none\ntwo\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_expected_external_edit_explicit_reload_arm_attributes_forced_reload(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "one\ntwo\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| {
+                log.begin_expected_external_edit(buffer.clone(), cx);
+            });
+        });
+
+        fs.save(
+            path!("/dir/file").as_ref(),
+            &"one\ntwo\nthree\n".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| {
+                log.arm_expected_external_reload(buffer.clone(), cx);
+            });
+        });
+
+        let reload = project.update(cx, |project, cx| {
+            let mut buffers = collections::HashSet::default();
+            buffers.insert(buffer.clone());
+            project.reload_buffers(buffers, false, cx)
+        });
+        reload.await.unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            action_log.read_with(cx, |log, cx| log.changed_buffers(cx).len()),
+            1,
+            "arming an expected reload should attribute an explicit reload before file-handle updates arrive"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_expected_external_edit_does_not_attribute_dirty_non_delete_external_changes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "one\ntwo\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let abs_path = PathBuf::from(path!("/dir/file"));
+
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| {
+                log.begin_expected_external_edit(buffer.clone(), cx);
+            });
+        });
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "zero\n")], None, cx).unwrap();
+        });
+        cx.run_until_parked();
+
+        fs.save(
+            path!("/dir/file").as_ref(),
+            &"one\ntwo\nthree\n".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            action_log.read_with(cx, |log, cx| log.changed_buffers(cx).is_empty()),
+            "dirty non-delete external changes should stay out of review until the behavior is explicitly supported"
+        );
+        assert!(
+            action_log.read_with(cx, |log, _| log.file_read_time(&abs_path).is_none()),
+            "unsupported dirty external changes should not record file_read_time"
+        );
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "zero\none\ntwo\n",
+            "unsupported dirty external changes should preserve local buffer contents"
         );
     }
 

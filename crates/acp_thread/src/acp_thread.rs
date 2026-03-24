@@ -1013,6 +1013,7 @@ struct RunningTurn {
     send_task: Task<()>,
 }
 
+#[derive(Clone)]
 struct InferredEditCandidateReady {
     nonce: u64,
     buffer: Entity<Buffer>,
@@ -1021,13 +1022,21 @@ struct InferredEditCandidateReady {
 enum InferredEditCandidateState {
     Pending { nonce: u64 },
     Ready(InferredEditCandidateReady),
+    Finalizing(InferredEditCandidateReady),
 }
 
 impl InferredEditCandidateState {
     fn nonce(&self) -> u64 {
         match self {
             Self::Pending { nonce } => *nonce,
-            Self::Ready(candidate) => candidate.nonce,
+            Self::Ready(candidate) | Self::Finalizing(candidate) => candidate.nonce,
+        }
+    }
+
+    fn into_buffer_to_end(self) -> Option<Entity<Buffer>> {
+        match self {
+            Self::Ready(candidate) | Self::Finalizing(candidate) => Some(candidate.buffer),
+            Self::Pending { .. } => None,
         }
     }
 }
@@ -1744,6 +1753,7 @@ impl AcpThread {
     fn should_infer_external_edits(tool_call: &ToolCall) -> bool {
         tool_call.tool_name.is_none()
             && tool_call.kind == acp::ToolKind::Edit
+            && tool_call.diffs().next().is_none()
             && !tool_call.locations.is_empty()
     }
 
@@ -1758,6 +1768,49 @@ impl AcpThread {
         nonce
     }
 
+    fn end_expected_external_edits(
+        &mut self,
+        buffers: impl IntoIterator<Item = Entity<Buffer>>,
+        cx: &mut Context<Self>,
+    ) {
+        for buffer in buffers {
+            self.action_log.update(cx, |action_log, cx| {
+                action_log.end_expected_external_edit(buffer, cx);
+            });
+        }
+    }
+
+    fn remove_inferred_edit_tool_call_if_empty(&mut self, tool_call_id: &acp::ToolCallId) {
+        let remove_tool_call = self
+            .inferred_edit_candidates
+            .get(tool_call_id)
+            .is_some_and(|candidates| candidates.is_empty());
+
+        if remove_tool_call {
+            self.inferred_edit_candidates.remove(tool_call_id);
+            self.finalizing_inferred_edit_tool_calls
+                .remove(tool_call_id);
+        }
+    }
+
+    fn clear_inferred_edit_tool_call_tracking(
+        &mut self,
+        tool_call_id: &acp::ToolCallId,
+    ) -> Vec<Entity<Buffer>> {
+        let buffers_to_end = self
+            .inferred_edit_candidates
+            .remove(tool_call_id)
+            .into_iter()
+            .flat_map(|candidates| candidates.into_values())
+            .filter_map(|candidate_state| candidate_state.into_buffer_to_end())
+            .collect::<Vec<_>>();
+
+        self.finalizing_inferred_edit_tool_calls
+            .remove(tool_call_id);
+
+        buffers_to_end
+    }
+
     fn remove_inferred_edit_candidate_if_matching(
         &mut self,
         tool_call_id: &acp::ToolCallId,
@@ -1765,35 +1818,25 @@ impl AcpThread {
         nonce: u64,
         cx: &mut Context<Self>,
     ) {
-        let mut buffer_to_end = None;
-        let remove_tool_call =
+        let buffer_to_end =
             if let Some(candidates) = self.inferred_edit_candidates.get_mut(tool_call_id) {
                 let should_remove = candidates
                     .get(abs_path)
                     .is_some_and(|candidate_state| candidate_state.nonce() == nonce);
+
                 if should_remove {
-                    if let Some(InferredEditCandidateState::Ready(candidate)) =
-                        candidates.remove(abs_path)
-                    {
-                        buffer_to_end = Some(candidate.buffer);
-                    }
+                    candidates
+                        .remove(abs_path)
+                        .and_then(|candidate_state| candidate_state.into_buffer_to_end())
+                } else {
+                    None
                 }
-                candidates.is_empty()
             } else {
-                false
+                None
             };
 
-        if let Some(buffer) = buffer_to_end {
-            self.action_log.update(cx, |action_log, cx| {
-                action_log.end_expected_external_edit(buffer, cx);
-            });
-        }
-
-        if remove_tool_call {
-            self.inferred_edit_candidates.remove(tool_call_id);
-            self.finalizing_inferred_edit_tool_calls
-                .remove(tool_call_id);
-        }
+        self.end_expected_external_edits(buffer_to_end, cx);
+        self.remove_inferred_edit_tool_call_if_empty(tool_call_id);
     }
 
     fn clear_inferred_edit_candidates_for_tool_calls(
@@ -1804,22 +1847,10 @@ impl AcpThread {
         let mut buffers_to_end = Vec::new();
 
         for tool_call_id in tool_call_ids {
-            if let Some(candidates) = self.inferred_edit_candidates.remove(&tool_call_id) {
-                for candidate_state in candidates.into_values() {
-                    if let InferredEditCandidateState::Ready(candidate) = candidate_state {
-                        buffers_to_end.push(candidate.buffer);
-                    }
-                }
-            }
-            self.finalizing_inferred_edit_tool_calls
-                .remove(&tool_call_id);
+            buffers_to_end.extend(self.clear_inferred_edit_tool_call_tracking(&tool_call_id));
         }
 
-        for buffer in buffers_to_end {
-            self.action_log.update(cx, |action_log, cx| {
-                action_log.end_expected_external_edit(buffer, cx);
-            });
-        }
+        self.end_expected_external_edits(buffers_to_end, cx);
     }
 
     fn finalize_all_inferred_edit_tool_calls(&mut self, cx: &mut Context<Self>) {
@@ -1850,37 +1881,28 @@ impl AcpThread {
             current_paths.insert(location.path.clone());
         }
 
-        let mut buffers_to_end = Vec::new();
-        let remove_tool_call = if let Some(candidates) =
-            self.inferred_edit_candidates.get_mut(tool_call_id)
-        {
-            let removed_paths = candidates
-                .keys()
-                .filter(|path| !current_paths.contains(*path))
-                .cloned()
-                .collect::<Vec<_>>();
-            for path in removed_paths {
-                if let Some(InferredEditCandidateState::Ready(candidate)) = candidates.remove(&path)
-                {
-                    buffers_to_end.push(candidate.buffer);
-                }
-            }
-            candidates.is_empty()
-        } else {
-            false
-        };
+        let buffers_to_end =
+            if let Some(candidates) = self.inferred_edit_candidates.get_mut(tool_call_id) {
+                let removed_paths = candidates
+                    .keys()
+                    .filter(|path| !current_paths.contains(*path))
+                    .cloned()
+                    .collect::<Vec<_>>();
 
-        for buffer in buffers_to_end {
-            self.action_log.update(cx, |action_log, cx| {
-                action_log.end_expected_external_edit(buffer, cx);
-            });
-        }
+                removed_paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        candidates
+                            .remove(&path)
+                            .and_then(|candidate_state| candidate_state.into_buffer_to_end())
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
 
-        if remove_tool_call {
-            self.inferred_edit_candidates.remove(tool_call_id);
-            self.finalizing_inferred_edit_tool_calls
-                .remove(tool_call_id);
-        }
+        self.end_expected_external_edits(buffers_to_end, cx);
+        self.remove_inferred_edit_tool_call_if_empty(tool_call_id);
     }
 
     fn register_inferred_edit_locations(
@@ -1995,23 +2017,121 @@ impl AcpThread {
         buffer: Entity<Buffer>,
         cx: &mut Context<Self>,
     ) {
-        let Some(candidates) = self.inferred_edit_candidates.get_mut(&tool_call_id) else {
-            return;
-        };
-        let Some(candidate_state) = candidates.get_mut(&abs_path) else {
-            return;
-        };
-        if candidate_state.nonce() != nonce {
-            return;
-        }
+        let buffer_for_action_log = {
+            let Some(candidates) = self.inferred_edit_candidates.get_mut(&tool_call_id) else {
+                return;
+            };
+            let Some(candidate_state) = candidates.get_mut(&abs_path) else {
+                return;
+            };
+            if candidate_state.nonce() != nonce {
+                return;
+            }
 
-        let buffer_for_action_log = buffer.clone();
-        *candidate_state =
-            InferredEditCandidateState::Ready(InferredEditCandidateReady { nonce, buffer });
+            *candidate_state = InferredEditCandidateState::Ready(InferredEditCandidateReady {
+                nonce,
+                buffer: buffer.clone(),
+            });
+            buffer
+        };
 
         self.action_log.update(cx, |action_log, cx| {
             action_log.begin_expected_external_edit(buffer_for_action_log, cx);
         });
+
+        if self
+            .finalizing_inferred_edit_tool_calls
+            .contains(&tool_call_id)
+        {
+            self.start_finalizing_ready_inferred_edit_candidates(tool_call_id, cx);
+        }
+    }
+
+    fn start_finalizing_ready_inferred_edit_candidates(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
+        let ready_candidates =
+            if let Some(candidates) = self.inferred_edit_candidates.get_mut(&tool_call_id) {
+                let ready_candidates = candidates
+                    .iter()
+                    .filter_map(|(abs_path, candidate_state)| match candidate_state {
+                        InferredEditCandidateState::Ready(candidate) => {
+                            Some((abs_path.clone(), candidate.clone()))
+                        }
+                        InferredEditCandidateState::Pending { .. }
+                        | InferredEditCandidateState::Finalizing(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                for (abs_path, candidate) in &ready_candidates {
+                    let Some(candidate_state) = candidates.get_mut(abs_path) else {
+                        continue;
+                    };
+                    if candidate_state.nonce() != candidate.nonce {
+                        continue;
+                    }
+
+                    *candidate_state = InferredEditCandidateState::Finalizing(candidate.clone());
+                }
+
+                ready_candidates
+            } else {
+                Vec::new()
+            };
+
+        for (abs_path, candidate) in ready_candidates {
+            self.finalize_inferred_edit_candidate(tool_call_id.clone(), abs_path, candidate, cx);
+        }
+
+        if !self.inferred_edit_candidates.contains_key(&tool_call_id) {
+            self.finalizing_inferred_edit_tool_calls
+                .remove(&tool_call_id);
+        }
+    }
+
+    fn finalize_inferred_edit_candidate(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+        abs_path: PathBuf,
+        candidate: InferredEditCandidateReady,
+        cx: &mut Context<Self>,
+    ) {
+        let nonce = candidate.nonce;
+        let buffer = candidate.buffer;
+        let should_reload = buffer.read_with(cx, |buffer, _| !buffer.is_dirty());
+        if !should_reload {
+            self.remove_inferred_edit_candidate_if_matching(&tool_call_id, &abs_path, nonce, cx);
+            return;
+        }
+
+        self.action_log.update(cx, |action_log, cx| {
+            action_log.arm_expected_external_reload(buffer.clone(), cx);
+        });
+
+        let project = self.project.clone();
+        cx.spawn::<_, anyhow::Result<()>>(async move |this, cx| {
+            let reload = project.update(cx, |project, cx| {
+                let mut buffers = HashSet::default();
+                buffers.insert(buffer.clone());
+                project.reload_buffers(buffers, false, cx)
+            });
+            reload.await.log_err();
+
+            this.update(cx, |this, cx| {
+                this.remove_inferred_edit_candidate_if_matching(
+                    &tool_call_id,
+                    &abs_path,
+                    nonce,
+                    cx,
+                );
+            })
+            .ok();
+
+            Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn finalize_inferred_edit_tool_call(
@@ -2028,75 +2148,9 @@ impl AcpThread {
             return;
         }
 
-        if !self
-            .finalizing_inferred_edit_tool_calls
-            .insert(tool_call_id.clone())
-        {
-            return;
-        }
-
-        let project = self.project.clone();
-        cx.spawn::<_, anyhow::Result<()>>(async move |this, cx| {
-            const MAX_ATTEMPTS: usize = 3;
-            const ATTEMPT_DELAY: Duration = Duration::from_millis(50);
-
-            for attempt in 0..MAX_ATTEMPTS {
-                let (ready_buffers, has_pending) = this
-                    .read_with(cx, |this, _| {
-                        let Some(candidates) = this.inferred_edit_candidates.get(&tool_call_id)
-                        else {
-                            return (Vec::new(), false);
-                        };
-
-                        let mut ready_buffers = Vec::new();
-                        let mut has_pending = false;
-
-                        for candidate_state in candidates.values() {
-                            match candidate_state {
-                                InferredEditCandidateState::Pending { .. } => has_pending = true,
-                                InferredEditCandidateState::Ready(candidate) => {
-                                    ready_buffers.push(candidate.buffer.clone());
-                                }
-                            }
-                        }
-
-                        (ready_buffers, has_pending)
-                    })
-                    .unwrap_or((Vec::new(), false));
-
-                if ready_buffers.is_empty() && !has_pending {
-                    break;
-                }
-
-                for buffer in ready_buffers {
-                    let should_reload = buffer.read_with(cx, |buffer, _| !buffer.is_dirty());
-                    if !should_reload {
-                        continue;
-                    }
-
-                    let reload = project.update(cx, |project, cx| {
-                        let mut buffers = HashSet::default();
-                        buffers.insert(buffer.clone());
-                        project.reload_buffers(buffers, false, cx)
-                    });
-                    reload.await.log_err();
-                }
-
-                if !has_pending || attempt + 1 == MAX_ATTEMPTS {
-                    break;
-                }
-
-                cx.background_executor().timer(ATTEMPT_DELAY).await;
-            }
-
-            this.update(cx, |this, cx| {
-                this.clear_inferred_edit_candidates_for_tool_calls([tool_call_id.clone()], cx);
-            })
-            .ok();
-
-            Ok(())
-        })
-        .detach_and_log_err(cx);
+        self.finalizing_inferred_edit_tool_calls
+            .insert(tool_call_id.clone());
+        self.start_finalizing_ready_inferred_edit_candidates(tool_call_id, cx);
     }
 
     fn refresh_inferred_edit_tool_call(
@@ -4451,18 +4505,29 @@ mod tests {
         locations: Vec<acp::ToolCallLocation>,
         cx: &mut TestAppContext,
     ) {
+        start_external_edit_tool_call_with_meta(thread, tool_call_id, locations, None, cx);
+    }
+
+    fn start_external_edit_tool_call_with_meta(
+        thread: &Entity<AcpThread>,
+        tool_call_id: &acp::ToolCallId,
+        locations: Vec<acp::ToolCallLocation>,
+        meta: Option<acp::Meta>,
+        cx: &mut TestAppContext,
+    ) {
         let tool_call_id = tool_call_id.clone();
         thread
             .update(cx, move |thread, cx| {
-                thread.handle_session_update(
-                    acp::SessionUpdate::ToolCall(
-                        acp::ToolCall::new(tool_call_id, "Label")
-                            .kind(acp::ToolKind::Edit)
-                            .status(acp::ToolCallStatus::InProgress)
-                            .locations(locations),
-                    ),
-                    cx,
-                )
+                let mut tool_call = acp::ToolCall::new(tool_call_id, "Label")
+                    .kind(acp::ToolKind::Edit)
+                    .status(acp::ToolCallStatus::InProgress)
+                    .locations(locations);
+
+                if let Some(meta) = meta {
+                    tool_call = tool_call.meta(meta);
+                }
+
+                thread.handle_session_update(acp::SessionUpdate::ToolCall(tool_call), cx)
             })
             .unwrap();
     }
@@ -4518,6 +4583,18 @@ mod tests {
                 .values()
                 .map(|candidates| candidates.len())
                 .sum()
+        })
+    }
+
+    fn inferred_edit_tool_call_is_finalizing(
+        thread: &Entity<AcpThread>,
+        tool_call_id: &acp::ToolCallId,
+        cx: &TestAppContext,
+    ) -> bool {
+        thread.read_with(cx, |thread, _| {
+            thread
+                .finalizing_inferred_edit_tool_calls
+                .contains(tool_call_id)
         })
     }
 
@@ -4799,6 +4876,213 @@ mod tests {
             vec![acp::ToolCallLocation::new(path!("/test/file.txt"))],
             cx,
         );
+        cx.run_until_parked();
+
+        complete_external_edit_tool_call(&thread, &tool_call_id, cx);
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+
+        assert_eq!(changed_buffer_count(&thread, cx), 0);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_external_edit_candidates_remain_active_until_late_readiness(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/test"), json!({"file.txt": "one\ntwo\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let abs_path = PathBuf::from(path!("/test/file.txt"));
+        let buffer = open_test_buffer(&project, Path::new(path!("/test/file.txt")), cx).await;
+
+        let tool_call_id = acp::ToolCallId::new("test");
+        start_external_edit_tool_call(&thread, &tool_call_id, Vec::new(), cx);
+
+        let nonce = thread.update(cx, |thread, _cx| {
+            let nonce = thread.allocate_inferred_edit_candidate_nonce();
+            {
+                let (_, tool_call) = thread.tool_call_mut(&tool_call_id).unwrap();
+                tool_call.locations = vec![acp::ToolCallLocation::new(abs_path.clone())];
+                tool_call.resolved_locations = vec![None];
+            }
+            thread
+                .inferred_edit_candidates
+                .entry(tool_call_id.clone())
+                .or_default()
+                .insert(
+                    abs_path.clone(),
+                    InferredEditCandidateState::Pending { nonce },
+                );
+            nonce
+        });
+
+        complete_external_edit_tool_call(&thread, &tool_call_id, cx);
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+
+        assert_eq!(inferred_edit_candidate_count(&thread, cx), 1);
+        assert!(inferred_edit_tool_call_is_finalizing(
+            &thread,
+            &tool_call_id,
+            cx
+        ));
+
+        thread.update(cx, |thread, cx| {
+            thread.set_inferred_edit_candidate_ready(
+                tool_call_id.clone(),
+                abs_path.clone(),
+                nonce,
+                buffer.clone(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(changed_buffer_count(&thread, cx), 0);
+        assert_eq!(inferred_edit_candidate_count(&thread, cx), 0);
+        assert!(!inferred_edit_tool_call_is_finalizing(
+            &thread,
+            &tool_call_id,
+            cx
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_tool_name_disables_external_edit_inference_for_location_edit_calls(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/test"), json!({"file.txt": "one\ntwo\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let tool_call_id = acp::ToolCallId::new("test");
+        start_external_edit_tool_call_with_meta(
+            &thread,
+            &tool_call_id,
+            vec![acp::ToolCallLocation::new(PathBuf::from(path!(
+                "/test/file.txt"
+            )))],
+            Some(meta_with_tool_name("edit_file")),
+            cx,
+        );
+        cx.run_until_parked();
+
+        assert_eq!(inferred_edit_candidate_count(&thread, cx), 0);
+        assert!(!cx.read(|cx| thread.read(cx).has_pending_edit_tool_calls()));
+
+        fs.save(
+            path!("/test/file.txt").as_ref(),
+            &"one\ntwo\nthree\n".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        complete_external_edit_tool_call(&thread, &tool_call_id, cx);
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+
+        assert_eq!(changed_buffer_count(&thread, cx), 0);
+    }
+
+    #[gpui::test]
+    async fn test_explicit_diff_content_disables_external_edit_inference_for_location_edit_calls(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/test"), json!({"file.txt": "one\ntwo\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let abs_path = PathBuf::from(path!("/test/file.txt"));
+        let tool_call_id = acp::ToolCallId::new("test");
+        start_external_edit_tool_call(
+            &thread,
+            &tool_call_id,
+            vec![acp::ToolCallLocation::new(abs_path.clone())],
+            cx,
+        );
+        cx.run_until_parked();
+
+        assert_eq!(inferred_edit_candidate_count(&thread, cx), 1);
+
+        let languages = project.read_with(cx, |project, _| project.languages().clone());
+        let diff = cx.new(|cx| {
+            Diff::finalized(
+                path!("/test/file.txt").to_string(),
+                Some("one\ntwo\n".into()),
+                "one\ntwo\nthree\n".into(),
+                languages,
+                cx,
+            )
+        });
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.update_tool_call(
+                    ToolCallUpdateDiff {
+                        id: tool_call_id.clone(),
+                        diff,
+                    },
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(inferred_edit_candidate_count(&thread, cx), 0);
+        assert!(cx.read(|cx| thread.read(cx).has_pending_edit_tool_calls()));
+
+        fs.save(
+            path!("/test/file.txt").as_ref(),
+            &"one\ntwo\nthree\n".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
         cx.run_until_parked();
 
         complete_external_edit_tool_call(&thread, &tool_call_id, cx);

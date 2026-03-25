@@ -1,5 +1,109 @@
+//! # Undo Manager
+//!
+//! ## Operations and Results
+//!
+//! Undo and Redo actions execute an operation against the filesystem, producing
+//! a result that is recorded back into the history in place of the original
+//! entry. Each result is the semantic inverse of its paired operation, so the
+//! cycle can repeat for continued undo and redo.
+//!
+//!  Operations                            Results
+//!  ─────────────────────────────────  ──────────────────────────────────────
+//!  Create(ProjectPath)               →  Created(ProjectPath)
+//!  Trash(ProjectPath)                →  Trashed(TrashedEntry)
+//!  Rename(ProjectPath, ProjectPath)  →  Renamed(ProjectPath, ProjectPath)
+//!  Restore(TrashedEntry)             →  Restored(ProjectPath)
+//!  Batch(Vec<Operation>)             →  Batch(Vec<Result>)
+//!
+//!
+//! ## History and Cursor
+//!
+//! The undo manager maintains an operation history with a cursor position (↑).
+//! Recording an operation appends it to the history and advances the cursor to
+//! the end. The cursor separates past entries (left of ↑) from future entries
+//! (right of ↑).
+//!
+//! ─ **Undo**: Takes the history entry just *before* ↑, executes its inverse,
+//!   records the result back in its place, and moves ↑ one step to the left.
+//! ─ **Redo**: Takes the history entry just *at* ↑, executes its inverse,
+//!   records the result back in its place, and advances ↑ one step to the right.
+//!
+//!
+//! ## Example
+//!
+//! User Operation  Create(src/main.rs)
+//! History
+//! 	0 Created(src/main.rs)
+//!     1 +++cursor+++
+//!
+//! User Operation  Rename(README.md, readme.md)
+//! History
+//! 	0 Created(src/main.rs)
+//! 	1 Renamed(README.md, readme.md)
+//!     2 +++cursor+++
+//!
+//! User Operation  Create(CONTRIBUTING.md)
+//! History
+//! 	0 Created(src/main.rs)
+//!     1 Renamed(README.md, readme.md)
+//! 	2 Created(CONTRIBUTING.md) ──┐
+//!     3 +++cursor+++               │(before the cursor)
+//!                                  │
+//!   ┌──────────────────────────────┴─────────────────────────────────────────────┐
+//!     Redoing will take the result at the cursor position, convert that into the
+//!     operation that can revert that result, execute that operation and replace
+//!     the result in the history with the new result, obtained from running the
+//!     inverse operation, advancing the cursor position.
+//!   └──────────────────────────────┬─────────────────────────────────────────────┘
+//!                                  │
+//!                                  │
+//! User Operation  Undo             v
+//! Execute         Created(CONTRIBUTING.md) ────────> Trash(CONTRIBUTING.md)
+//! Record          Trashed(TrashedEntry(1))
+//! History
+//! 	0 Created(src/main.rs)
+//! 	1 Renamed(README.md, readme.md) ─┐
+//!     2 +++cursor+++                   │(before the cursor)
+//! 	2 Trashed(TrashedEntry(1))       │
+//!                                      │
+//! User Operation  Undo                 v
+//! Execute         Renamed(README.md, readme.md) ───> Rename(readme.md, README.md)
+//! Record          Renamed(readme.md, README.md)
+//! History
+//! 	0 Created(src/main.rs)
+//!     1 +++cursor+++
+//! 	1 Renamed(readme.md, README.md) ─┐ (at the cursor)
+//! 	2 Trashed(TrashedEntry(1))       │
+//!                                      │
+//!   ┌──────────────────────────────────┴─────────────────────────────────────────┐
+//!     Redoing will take the result at the cursor position, convert that into the
+//!     operation that can revert that result, execute that operation and replace
+//!     the result in the history with the new result, obtained from running the
+//!     inverse operation, advancing the cursor position.
+//!   └──────────────────────────────────┬─────────────────────────────────────────┘
+//!                                      │
+//!                                      │
+//! User Operation  Redo                 v
+//! Execute         Renamed(readme.md, README.md) ───> Rename(README.md, readme.md)
+//! Record          Renamed(README.md, readme.md)
+//! History
+//! 	0 Created(src/main.rs)
+//! 	1 Renamed(README.md, readme.md)
+//!     2 +++cursor+++
+//! 	2 Trashed(TrashedEntry(1))────┐ (at the cursor)
+//!                                   │
+//! User Operation  Redo              v
+//! Execute         Trashed(TrashedEntry(1)) ────────> Restore(TrashedEntry(1))
+//! Record          Restored(ProjectPath)
+//! History
+//! 	0 Created(src/main.rs)
+//! 	1 Renamed(README.md, readme.md)
+//! 	2 Trashed(TrashedEntry)
+//!     2 +++cursor+++
+
 use crate::ProjectPanel;
 use anyhow::{Result, anyhow};
+use fs::TrashedEntry;
 use gpui::{AppContext, SharedString, Task, WeakEntity};
 use project::ProjectPath;
 use std::collections::VecDeque;
@@ -8,23 +112,98 @@ use workspace::{
     Workspace,
     notifications::{NotificationId, simple_message_notification::MessageNotification},
 };
+use worktree::CreatedEntry;
 
+enum Operation {
+    Create(ProjectPath),
+    Trash(ProjectPath),
+    Rename(ProjectPath, ProjectPath),
+    Restore(TrashedEntry),
+    Batch(Vec<Operation>),
+}
+
+impl Operation {
+    async fn execute(self, undo_manager: &UndoManager, cx: &mut App) -> Result<Change> {
+        Ok(match self {
+            Operation::Create(project_path) => {
+                undo_manager.create(&project_path, cx).await?;
+                Change::Created(project_path)
+            }
+            Operation::Trash(project_path) => {
+                let trash_entry = undo_manager.trash(&project_path, cx).await?;
+                Change::Trashed(trash_entry)
+            }
+            Operation::Rename(from, to) => {
+                undo_manager.rename(&from, &to, cx).await?;
+                Change::Renamed(from, to)
+            }
+            Operation::Restore(_trashed_entry) => {
+                todo!("bunch of work, need to add restore through the whole onion")
+                // undo_manager.restore(&trashed_entry, cx).await?;
+                // Change::Restored(project_path)
+            }
+            Operation::Batch(operations) => {
+                let mut res = Vec::new();
+                for op in operations {
+                    res.push(Box::pin(op.execute(undo_manager, cx)).await?);
+                }
+                Change::Batched(res)
+            }
+        })
+    }
+}
+
+#[derive(Clone)]
+enum Change {
+    Created(ProjectPath),
+    Trashed(TrashedEntry),
+    Renamed(ProjectPath, ProjectPath),
+    Restored(ProjectPath),
+    Batched(Vec<Change>),
+}
+
+impl Change {
+    fn to_inverse(self) -> Operation {
+        match self {
+            Change::Created(project_path) => Operation::Trash(project_path),
+            Change::Trashed(trashed_entry) => Operation::Restore(trashed_entry),
+            Change::Renamed(from, to) => Operation::Rename(to, from),
+            Change::Restored(project_path) => Operation::Trash(project_path),
+            // When inverting a batch of operations, we reverse the order of
+            // operations to handle dependencies between them. For example, if a
+            // batch contains the following order of operations:
+            //
+            // 1. Create `src/`
+            // 2. Create `src/main.rs`
+            //
+            // If we first tried to revert the directory creation, it would fail
+            // because there's still files inside the directory.
+            Change::Batched(changes) => {
+                Operation::Batch(changes.into_iter().rev().map(Change::to_inverse).collect())
+            }
+        }
+    }
+}
+
+// Imagine pressing undo 10000+ times?!
 const MAX_UNDO_OPERATIONS: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProjectPanelOperation {
     Batch(Vec<ProjectPanelOperation>),
     Create(ProjectPath),
-    Trash(ProjectPath),
     Rename(ProjectPath, ProjectPath),
+    // TODO!: Check if we want to use `fs::TrashedEntry` or if we'll want to
+    // `delete_entry`, etc.
+    // better with the existing `worktree::CreatedEntry` or project's
+    // introduce something else, maybe `worktree::TrashedEntry` so it fits
+    Restore(TrashedEntry),
+    Trash(ProjectPath),
 }
 
 impl ProjectPanelOperation {
     fn inverse(&self) -> Self {
         match self {
-            Self::Create(project_path) => Self::Trash(project_path.clone()),
-            Self::Trash(project_path) => Self::Create(project_path.clone()),
-            Self::Rename(from, to) => Self::Rename(to.clone(), from.clone()),
             // When inverting a batch of operations, we reverse the order of
             // operations to handle dependencies between them. For example, if a
             // batch contains the following order of operations:
@@ -41,6 +220,17 @@ impl ProjectPanelOperation {
                     .map(|operation| operation.inverse())
                     .collect(),
             ),
+            Self::Create(project_path) => Self::Trash(project_path.clone()),
+            Self::Rename(from, to) => Self::Rename(to.clone(), from.clone()),
+            Self::Restore(_trashed_entry) => {
+                // TODO!: How can we build the `ProjectPath` from a
+                // `fs::TrashedEntry`?
+                std::unimplemented!();
+            }
+            // TODO!: Update this such that, the inverse of `Trash` should be
+            // `Restore`, but it can only be constructed when we have the actual
+            // `TrashedEntry`, not sure how we'll do that.
+            Self::Trash(project_path) => Self::Create(project_path.clone()),
         }
     }
 }
@@ -48,8 +238,8 @@ impl ProjectPanelOperation {
 pub struct UndoManager {
     workspace: WeakEntity<Workspace>,
     panel: WeakEntity<ProjectPanel>,
-    undo_stack: VecDeque<ProjectPanelOperation>,
-    redo_stack: Vec<ProjectPanelOperation>,
+    history: VecDeque<Change>,
+    cursor: usize,
     /// Maximum number of operations to keep on the undo history.
     limit: usize,
 }
@@ -67,123 +257,82 @@ impl UndoManager {
         Self {
             workspace,
             panel,
+            history: VecDeque::new(),
+            cursor: 0usize,
             limit,
-            undo_stack: VecDeque::new(),
-            redo_stack: Vec::new(),
         }
     }
 
     pub fn can_undo(&self) -> bool {
-        !self.undo_stack.is_empty()
+        self.cursor > 0
     }
 
     pub fn can_redo(&self) -> bool {
-        !self.redo_stack.is_empty()
+        self.cursor < self.history.len()
     }
 
-    pub fn undo(&mut self, cx: &mut App) {
-        if let Some(operation) = self.undo_stack.pop_back() {
-            let task = self.execute_operation(&operation, cx);
-            let panel = self.panel.clone();
-            let workspace = self.workspace.clone();
-
-            cx.spawn(async move |cx| match task.await {
-                Ok(operation) => panel.update(cx, |panel, _cx| {
-                    panel.undo_manager.redo_stack.push(operation)
-                }),
-                Err(err) => cx.update(|cx| {
-                    Self::show_error(
-                        "Failed to undo Project Panel Operation(s)",
-                        workspace,
-                        err.to_string().into(),
-                        cx,
-                    );
-
-                    Ok(())
-                }),
-            })
-            .detach();
+    pub async fn undo(&mut self, cx: &mut App) -> Result<()> {
+        if !self.can_undo() {
+            return Ok(());
         }
+
+        // TODO!: Comment why we're doing self.cursor -= 1 here, before
+        // exedcuting operation.
+        let before_cursor = self.cursor - 1;
+        self.cursor -= 1;
+
+        let change = self
+            .history
+            .get(before_cursor)
+            .expect("we can undo")
+            .clone();
+        let mut new_change = change.to_inverse().execute(self, cx).await?;
+        let change = self.history.get_mut(before_cursor).expect("we can undo");
+        std::mem::swap(change, &mut new_change);
+        Ok(())
     }
 
     pub fn redo(&mut self, cx: &mut App) {
-        if let Some(operation) = self.redo_stack.pop() {
-            let task = self.execute_operation(&operation, cx);
-            let panel = self.panel.clone();
-            let workspace = self.workspace.clone();
-
-            cx.spawn(async move |cx| match task.await {
-                Ok(operation) => panel.update(cx, |panel, _cx| {
-                    panel.undo_manager.undo_stack.push_back(operation)
-                }),
-                Err(err) => cx.update(|cx| {
-                    Self::show_error(
-                        "Failed to redo Project Panel Operation(s)",
-                        workspace,
-                        err.to_string().into(),
-                        cx,
-                    );
-
-                    Ok(())
-                }),
-            })
-            .detach();
+        if !self.can_redo() {
+            return;
         }
     }
 
-    pub fn record(&mut self, operation: ProjectPanelOperation) {
-        // Recording a new operation while there's still operations in the
-        // `redo_stack` should clear all operations from the `redo_stack`, as we
-        // might end up in a situation where the state diverges and the
-        // `redo_stack` operations can no longer be done.
-        if !self.redo_stack.is_empty() {
-            self.redo_stack.clear();
+    pub fn record(&mut self, change: Change) {
+        // TODO!: Proper comment explaining this.
+        if self.cursor < self.history.len() {
+            self.history.drain(self.cursor..);
         }
 
-        if self.undo_stack.len() >= self.limit {
-            self.undo_stack.pop_front();
+        if self.history.len() >= self.limit {
+            self.history.pop_front();
         }
 
-        self.undo_stack.push_back(operation.inverse());
+        self.history.push_back(change);
     }
 
-    pub fn record_batch(&mut self, operations: impl IntoIterator<Item = ProjectPanelOperation>) {
-        let mut operations = operations.into_iter().collect::<Vec<_>>();
-        let operation = match operations.len() {
+    pub fn record_batch(&mut self, changes: impl IntoIterator<Item = Change>) {
+        let mut changes = changes.into_iter().collect::<Vec<_>>();
+        let change = match changes.len() {
             0 => return,
-            1 => operations.pop().unwrap(),
-            _ => ProjectPanelOperation::Batch(operations),
+            1 => changes.pop().unwrap(),
+            _ => Change::Batched(changes),
         };
 
-        self.record(operation);
+        self.record(change);
     }
 
-    /// Attempts to execute the provided operation, returning the inverse of the
-    /// provided `operation` as a result.
-    fn execute_operation(
-        &mut self,
-        operation: &ProjectPanelOperation,
-        cx: &mut App,
-    ) -> Task<Result<ProjectPanelOperation>> {
-        match operation {
-            ProjectPanelOperation::Rename(from, to) => self.rename(from, to, cx),
-            ProjectPanelOperation::Trash(project_path) => self.trash(project_path, cx),
-            ProjectPanelOperation::Create(project_path) => self.create(project_path, cx),
-            ProjectPanelOperation::Batch(operations) => self.batch(operations, cx),
-        }
-    }
-
-    fn rename(
+    async fn rename(
         &self,
         from: &ProjectPath,
         to: &ProjectPath,
         cx: &mut App,
-    ) -> Task<Result<ProjectPanelOperation>> {
+    ) -> Result<CreatedEntry> {
         let Some(workspace) = self.workspace.upgrade() else {
-            return Task::ready(Err(anyhow!("Failed to obtain workspace.")));
+            return Err(anyhow!("Failed to obtain workspace."));
         };
 
-        let result = workspace.update(cx, |workspace, cx| {
+        let res: Result<Task<Result<CreatedEntry>>> = workspace.update(cx, |workspace, cx| {
             workspace.project().update(cx, |project, cx| {
                 let entry_id = project
                     .entry_for_path(from, cx)
@@ -194,110 +343,61 @@ impl UndoManager {
             })
         });
 
-        let task = match result {
-            Ok(task) => task,
-            Err(err) => return Task::ready(Err(err)),
-        };
-
-        let from = from.clone();
-        let to = to.clone();
-        cx.spawn(async move |_| match task.await {
-            Err(err) => Err(err),
-            Ok(_) => Ok(ProjectPanelOperation::Rename(to.clone(), from.clone())),
-        })
+        res?.await
     }
 
-    fn create(
-        &self,
-        project_path: &ProjectPath,
-        cx: &mut App,
-    ) -> Task<Result<ProjectPanelOperation>> {
+    async fn create(&self, project_path: &ProjectPath, cx: &mut App) -> Result<CreatedEntry> {
         let Some(workspace) = self.workspace.upgrade() else {
-            return Task::ready(Err(anyhow!("Failed to obtain workspace.")));
+            return Err(anyhow!("Failed to obtain workspace."));
         };
 
-        let task = workspace.update(cx, |workspace, cx| {
-            workspace.project().update(cx, |project, cx| {
-                // This should not be hardcoded to `false`, as it can genuinely
-                // be a directory and it misses all the nuances and details from
-                // `ProjectPanel::confirm_edit`. However, we expect this to be a
-                // short-lived solution as we add support for restoring trashed
-                // files, at which point we'll no longer need to `Create` new
-                // files, any redoing of a trash operation should be a restore.
-                let is_directory = false;
-                project.create_entry(project_path.clone(), is_directory, cx)
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.project().update(cx, |project, cx| {
+                    // This should not be hardcoded to `false`, as it can genuinely
+                    // be a directory and it misses all the nuances and details from
+                    // `ProjectPanel::confirm_edit`. However, we expect this to be a
+                    // short-lived solution as we add support for restoring trashed
+                    // files, at which point we'll no longer need to `Create` new
+                    // files, any redoing of a trash operation should be a restore.
+                    let is_directory = false;
+                    project.create_entry(project_path.clone(), is_directory, cx)
+                })
             })
-        });
-
-        let project_path = project_path.clone();
-        cx.spawn(async move |_| match task.await {
-            Ok(_) => Ok(ProjectPanelOperation::Trash(project_path)),
-            Err(err) => Err(err),
-        })
+            .await
     }
 
-    fn trash(
-        &self,
-        project_path: &ProjectPath,
-        cx: &mut App,
-    ) -> Task<Result<ProjectPanelOperation>> {
+    async fn trash(&self, project_path: &ProjectPath, cx: &mut App) -> Result<TrashedEntry> {
         let Some(workspace) = self.workspace.upgrade() else {
-            return Task::ready(Err(anyhow!("Failed to obtain workspace.")));
+            return Err(anyhow!("Failed to obtain workspace."));
         };
 
-        let result = workspace.update(cx, |workspace, cx| {
-            workspace.project().update(cx, |project, cx| {
-                let entry_id = project
-                    .entry_for_path(&project_path, cx)
-                    .map(|entry| entry.id)
-                    .ok_or_else(|| anyhow!("No entry for path."))?;
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.project().update(cx, |project, cx| {
+                    let entry_id = project
+                        .entry_for_path(&project_path, cx)
+                        .map(|entry| entry.id)
+                        .ok_or_else(|| anyhow!("No entry for path."))?;
 
-                project
-                    .delete_entry(entry_id, true, cx)
-                    .ok_or_else(|| anyhow!("Failed to trash entry."))
+                    project
+                        .delete_entry(entry_id, true, cx)
+                        .ok_or_else(|| anyhow!("Worktree entry should exist"))
+                })
+            })?
+            .await
+            .and_then(|entry| {
+                entry.ok_or_else(|| anyhow!("When trashing we should always get a trashentry"))
             })
-        });
-
-        let task = match result {
-            Ok(task) => task,
-            Err(err) => return Task::ready(Err(err)),
-        };
-
-        let project_path = project_path.clone();
-        cx.spawn(async move |_| match task.await {
-            // We'll want this to eventually be a `Restore` operation, once
-            // we've added support, in `fs` to track and restore a trashed file.
-            Ok(_) => Ok(ProjectPanelOperation::Create(project_path)),
-            Err(err) => Err(err),
-        })
     }
 
-    fn batch(
+    fn restore(
         &mut self,
-        operations: &[ProjectPanelOperation],
-        cx: &mut App,
+        _trashed_entry: &TrashedEntry,
+        _cx: &mut App,
     ) -> Task<Result<ProjectPanelOperation>> {
-        let tasks: Vec<_> = operations
-            .into_iter()
-            .map(|operation| self.execute_operation(operation, cx))
-            .collect();
-
-        cx.spawn(async move |_| {
-            let mut operations = Vec::new();
-
-            for task in tasks {
-                match task.await {
-                    Ok(operation) => operations.push(operation),
-                    Err(err) => return Err(err),
-                }
-            }
-
-            // Return the `ProjectPanelOperation::Batch` that reverses all of
-            // the provided operations. The order of operations should be reversed
-            // so that dependencies are handled correctly.
-            operations.reverse();
-            Ok(ProjectPanelOperation::Batch(operations))
-        })
+        // TODO!: Implement actual call to `RealFs::restore`.
+        Task::ready(Err(anyhow!("Not implemented")))
     }
 
     /// Displays a notification with the provided `title` and `error`.

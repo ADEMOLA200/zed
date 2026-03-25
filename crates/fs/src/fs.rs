@@ -176,7 +176,11 @@ pub trait Fs: Send + Sync {
     }
 }
 
-/// Represents a file or directory that was moved to the system's trash.
+// We use our own type rather than `trash::TrashItem` directly to avoid carrying
+// over fields we don't need (e.g. `time_deleted`) and to insulate callers and
+// tests from changes to that crate's API surface.
+/// Represents a file or directory that has been moved to the system trash,
+/// retaining enough information to restore it to its original location.
 #[derive(Clone)]
 pub struct TrashedEntry {
     /// Platform-specific identifier for the file/directory in the trash.
@@ -185,9 +189,9 @@ pub struct TrashedEntry {
     /// * macOS & Windows – Full path to the file/directory in the system's
     /// trash.
     pub id: OsString,
-    // Original name of the file/directory before it was moved to the trash.
+    /// Original name of the file/directory before it was moved to the trash.
     pub name: OsString,
-    // Original parent directory.
+    /// Original parent directory.
     pub original_parent: PathBuf,
 }
 

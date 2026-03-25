@@ -903,7 +903,8 @@ impl TextThreadStore {
             }
             ContextServerStatus::Stopped
             | ContextServerStatus::Error(_)
-            | ContextServerStatus::AuthRequired => {
+            | ContextServerStatus::AuthRequired
+            | ContextServerStatus::ClientSecretRequired => {
                 if let Some(slash_command_ids) =
                     self.context_server_slash_command_ids.remove(server_id)
                 {

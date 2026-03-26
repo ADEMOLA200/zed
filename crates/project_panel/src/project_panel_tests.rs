@@ -2519,7 +2519,7 @@ async fn test_undo_batch(cx: &mut gpui::TestAppContext) {
     // ourselves, knowing that the filesystem already has the folder and file
     // being provided in the operations.
     panel.update(cx, |panel, _cx| {
-        panel.undo_manager.record_batch(vec![
+        panel.undo_manager.record(vec![
             build_create_operation(worktree_id, "src/main.rs"),
             build_create_operation(worktree_id, "src/"),
         ]);
@@ -2580,7 +2580,7 @@ async fn test_redo_batch(cx: &mut gpui::TestAppContext) {
     // operation, to ensure that undoing and redoing a batch operation works as
     // expected.
     panel.update(cx, |panel, _cx| {
-        panel.undo_manager.record_batch(vec![
+        panel.undo_manager.record(vec![
             build_rename_operation(worktree_id, "file_a.txt", "file_c.txt"),
             build_rename_operation(worktree_id, "file_b.txt", "file_d.txt"),
         ]);

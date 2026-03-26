@@ -83,7 +83,7 @@ use zed_actions::{
     workspace::OpenWithSystem,
 };
 
-use crate::undo::{ProjectPanelOperation, UndoManager};
+use crate::undo::{Change, UndoManager};
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
@@ -1948,14 +1948,11 @@ impl ProjectPanel {
                 // Record the operation if the edit was applied
                 if new_entry.is_ok() {
                     let operation = if let Some(old_entry) = edited_entry {
-                        ProjectPanelOperation::Rename(
-                            (worktree_id, old_entry.path).into(),
-                            new_project_path,
-                        )
+                        Change::Renamed((worktree_id, old_entry.path).into(), new_project_path)
                     } else {
-                        ProjectPanelOperation::Create(new_project_path)
+                        Change::Created(new_project_path)
                     };
-                    project_panel.undo_manager.record(operation);
+                    project_panel.undo_manager.record([operation]);
                 }
 
                 cx.notify();
@@ -3189,7 +3186,7 @@ impl ProjectPanel {
 
             cx.spawn_in(window, async move |project_panel, mut cx| {
                 let mut last_succeed = None;
-                let mut operations = Vec::new();
+                let mut changes = Vec::new();
 
                 for task in paste_tasks {
                     match task {
@@ -3198,7 +3195,7 @@ impl ProjectPanel {
                                 .await
                                 .notify_workspace_async_err(workspace.clone(), &mut cx)
                             {
-                                operations.push(ProjectPanelOperation::Rename(from, to));
+                                changes.push(Change::Renamed(from, to));
                                 last_succeed = Some(entry);
                             }
                         }
@@ -3207,7 +3204,7 @@ impl ProjectPanel {
                                 .await
                                 .notify_workspace_async_err(workspace.clone(), &mut cx)
                             {
-                                operations.push(ProjectPanelOperation::Create(destination));
+                                changes.push(Change::Created(destination));
                                 last_succeed = Some(entry);
                             }
                         }
@@ -3216,7 +3213,7 @@ impl ProjectPanel {
 
                 project_panel
                     .update(cx, |this, _| {
-                        this.undo_manager.record_batch(operations);
+                        this.undo_manager.record(changes);
                     })
                     .ok();
 
@@ -4516,13 +4513,11 @@ impl ProjectPanel {
 
                 cx.spawn_in(window, async move |project_panel, cx| {
                     let mut last_succeed = None;
-                    let mut operations = Vec::new();
+                    let mut changes = Vec::new();
                     for task in copy_tasks.into_iter() {
                         if let Some(Some(entry)) = task.await.log_err() {
                             last_succeed = Some(entry.id);
-                            operations.push(ProjectPanelOperation::Create(
-                                (worktree_id, entry.path).into(),
-                            ));
+                            changes.push(Change::Created((worktree_id, entry.path).into()));
                         }
                     }
                     // update selection
@@ -4534,7 +4529,7 @@ impl ProjectPanel {
                                     entry_id,
                                 });
 
-                                project_panel.undo_manager.record_batch(operations);
+                                project_panel.undo_manager.record(changes);
 
                                 // if only one entry was dragged and it was disambiguated, open the rename editor
                                 if item_count == 1 && disambiguation_range.is_some() {
@@ -4618,7 +4613,7 @@ impl ProjectPanel {
             let workspace = self.workspace.clone();
             if folded_selection_info.is_empty() {
                 cx.spawn_in(window, async move |project_panel, mut cx| {
-                    let mut operations = Vec::new();
+                    let mut changes = Vec::new();
                     for (entry_id, task) in move_tasks {
                         if let Some(CreatedEntry::Included(new_entry)) = task
                             .await
@@ -4627,7 +4622,7 @@ impl ProjectPanel {
                             if let (Some(old_path), Some(worktree_id)) =
                                 (old_paths.get(&entry_id), destination_worktree_id)
                             {
-                                operations.push(ProjectPanelOperation::Rename(
+                                changes.push(Change::Renamed(
                                     old_path.clone(),
                                     (worktree_id, new_entry.path).into(),
                                 ));
@@ -4636,7 +4631,7 @@ impl ProjectPanel {
                     }
                     project_panel
                         .update(cx, |this, _| {
-                            this.undo_manager.record_batch(operations);
+                            this.undo_manager.record(changes);
                         })
                         .ok();
                 })
@@ -4654,7 +4649,7 @@ impl ProjectPanel {
                             if let (Some(old_path), Some(worktree_id)) =
                                 (old_paths.get(&entry_id), destination_worktree_id)
                             {
-                                operations.push(ProjectPanelOperation::Rename(
+                                operations.push(Change::Renamed(
                                     old_path.clone(),
                                     (worktree_id, new_entry.path.clone()).into(),
                                 ));
@@ -4669,7 +4664,7 @@ impl ProjectPanel {
 
                     project_panel
                         .update(cx, |this, _| {
-                            this.undo_manager.record_batch(operations);
+                            this.undo_manager.record(operations);
                         })
                         .ok();
 

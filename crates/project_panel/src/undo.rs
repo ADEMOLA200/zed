@@ -98,7 +98,7 @@
 //! History
 //! 	0 Created(src/main.rs)
 //! 	1 Renamed(README.md, readme.md)
-//! 	2 Trashed(TrashedEntry)
+//! 	2 Restored(ProjectPath)
 //!     2 +++cursor+++
 
 use crate::ProjectPanel;
@@ -137,10 +137,9 @@ impl Operation {
                 undo_manager.rename(&from, &to, cx).await?;
                 Change::Renamed(from, to)
             }
-            Operation::Restore(_trashed_entry) => {
-                todo!("bunch of work, need to add restore through the whole onion")
-                // undo_manager.restore(&trashed_entry, cx).await?;
-                // Change::Restored(project_path)
+            Operation::Restore(trashed_entry) => {
+                let project_path = undo_manager.restore(&trashed_entry, cx).await?;
+                Change::Restored(project_path)
             }
             Operation::Batch(operations) => {
                 let mut res = Vec::new();
@@ -154,7 +153,7 @@ impl Operation {
 }
 
 #[derive(Clone)]
-enum Change {
+pub(crate) enum Change {
     Created(ProjectPath),
     Trashed(TrashedEntry),
     Renamed(ProjectPath, ProjectPath),
@@ -187,53 +186,6 @@ impl Change {
 
 // Imagine pressing undo 10000+ times?!
 const MAX_UNDO_OPERATIONS: usize = 10_000;
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ProjectPanelOperation {
-    Batch(Vec<ProjectPanelOperation>),
-    Create(ProjectPath),
-    Rename(ProjectPath, ProjectPath),
-    // TODO!: Check if we want to use `fs::TrashedEntry` or if we'll want to
-    // `delete_entry`, etc.
-    // better with the existing `worktree::CreatedEntry` or project's
-    // introduce something else, maybe `worktree::TrashedEntry` so it fits
-    Restore(TrashedEntry),
-    Trash(ProjectPath),
-}
-
-impl ProjectPanelOperation {
-    fn inverse(&self) -> Self {
-        match self {
-            // When inverting a batch of operations, we reverse the order of
-            // operations to handle dependencies between them. For example, if a
-            // batch contains the following order of operations:
-            //
-            // 1. Create `src/`
-            // 2. Create `src/main.rs`
-            //
-            // If we first tried to revert the directory creation, it would fail
-            // because there's still files inside the directory.
-            Self::Batch(operations) => Self::Batch(
-                operations
-                    .iter()
-                    .rev()
-                    .map(|operation| operation.inverse())
-                    .collect(),
-            ),
-            Self::Create(project_path) => Self::Trash(project_path.clone()),
-            Self::Rename(from, to) => Self::Rename(to.clone(), from.clone()),
-            Self::Restore(_trashed_entry) => {
-                // TODO!: How can we build the `ProjectPath` from a
-                // `fs::TrashedEntry`?
-                std::unimplemented!();
-            }
-            // TODO!: Update this such that, the inverse of `Trash` should be
-            // `Restore`, but it can only be constructed when we have the actual
-            // `TrashedEntry`, not sure how we'll do that.
-            Self::Trash(project_path) => Self::Create(project_path.clone()),
-        }
-    }
-}
 
 pub struct UndoManager {
     workspace: WeakEntity<Workspace>,
@@ -276,50 +228,95 @@ impl UndoManager {
             return Ok(());
         }
 
-        // TODO!: Comment why we're doing self.cursor -= 1 here, before
-        // exedcuting operation.
-        let before_cursor = self.cursor - 1;
-        self.cursor -= 1;
+        // Undo failure:
+        //
+        // History
+        // 	0 Created(src/main.rs)
+        // 	1 Renamed(README.md, readme.md) ─┐
+        //     2 +++cursor+++                │(before the cursor)
+        // 	2 Trashed(TrashedEntry(1))       │
+        //                                   │
+        // User Operation  Undo              v
+        // Failed execute  Renamed(README.md, readme.md) ───> Rename(readme.md, README.md)
+        // Record nothing
+        // History
+        // 	0 Created(src/main.rs)
+        //     1 +++cursor+++
+        // 	1 Trashed(TrashedEntry(1)) -----
+        //                                  |(at the cursor)
+        // User Operation  Redo             v
+        // Execute         Trashed(TrashedEntry(1)) ────────> Restore(TrashedEntry(1))
+        // Record          Restored(ProjectPath)
+        // History
+        // 	0 Created(src/main.rs)
+        // 	1 Restored(ProjectPath)
+        //  1 +++cursor+++
 
-        let change = self
+        // We always want to move the cursor back regardless of whether undoing
+        // suceeds or fails, otherwise the cursor could end up pointing to a
+        // position outside of the history, as we remove the change before the
+        // cursor, in case undo fails.
+        let before_cursor = self.cursor - 1; // see docs above
+        self.cursor -= 1; // take a step back into the past
+
+        let change_before_the_cursor = self
             .history
-            .get(before_cursor)
+            .remove(before_cursor)
             .expect("we can undo")
             .clone();
-        let mut new_change = change.to_inverse().execute(self, cx).await?;
-        let change = self.history.get_mut(before_cursor).expect("we can undo");
-        std::mem::swap(change, &mut new_change);
+        // If this fails we can not redo/undo this change so it needs to
+        // be gone from history, thats why we just removed it above! :)
+        let change_created_by_undoing = change_before_the_cursor
+            .to_inverse()
+            .execute(self, cx)
+            .await?;
+        self.history
+            .insert(before_cursor, change_created_by_undoing);
         Ok(())
     }
 
-    pub fn redo(&mut self, cx: &mut App) {
+    pub async fn redo(&mut self, cx: &mut App) -> Result<()> {
         if !self.can_redo() {
-            return;
+            return Ok(());
         }
+
+        let change_at_the_cursor = self
+            .history
+            .remove(self.cursor)
+            .expect("we can redo")
+            .clone();
+        let redo_change = change_at_the_cursor.to_inverse().execute(self, cx).await?;
+        self.history.insert(self.cursor, redo_change);
+        self.cursor += 1;
+        Ok(())
     }
 
-    pub fn record(&mut self, change: Change) {
-        // TODO!: Proper comment explaining this.
+    /// Passed in changes will always be performed as a single step
+    pub fn record(&mut self, changes: impl IntoIterator<Item = Change>) {
+        let mut changes = changes.into_iter();
+        let Some(first) = changes.by_ref().next() else {
+            return;
+        };
+
+        let change = if let Some(second) = changes.by_ref().next() {
+            Change::Batched([first].into_iter().chain([second]).chain(changes).collect())
+        } else {
+            first
+        };
+
+        // When recording a new change, discard any changes that could still be
+        // redone.
         if self.cursor < self.history.len() {
             self.history.drain(self.cursor..);
         }
 
+        // Ensure that the number of recorded changes does not exceed the
+        // maximum amount of tracked changes.
         if self.history.len() >= self.limit {
             self.history.pop_front();
         }
 
         self.history.push_back(change);
-    }
-
-    pub fn record_batch(&mut self, changes: impl IntoIterator<Item = Change>) {
-        let mut changes = changes.into_iter().collect::<Vec<_>>();
-        let change = match changes.len() {
-            0 => return,
-            1 => changes.pop().unwrap(),
-            _ => Change::Batched(changes),
-        };
-
-        self.record(change);
     }
 
     async fn rename(
@@ -391,13 +388,23 @@ impl UndoManager {
             })
     }
 
-    fn restore(
-        &mut self,
-        _trashed_entry: &TrashedEntry,
-        _cx: &mut App,
-    ) -> Task<Result<ProjectPanelOperation>> {
-        // TODO!: Implement actual call to `RealFs::restore`.
-        Task::ready(Err(anyhow!("Not implemented")))
+    async fn restore(&self, trashed_entry: &TrashedEntry, cx: &mut App) -> Result<ProjectPath> {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Err(anyhow!("Failed to obtain workspace."));
+        };
+
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.project().update(cx, |project, cx| {
+                    project
+                        .restore_entry(trashed_entry, cx)
+                        .ok_or_else(|| anyhow!("Worktree entry should exist"))
+                })
+            })?
+            .await
+            .and_then(|entry| {
+                entry.ok_or_else(|| anyhow!("When trashing we should always get a trashentry"))
+            })
     }
 
     /// Displays a notification with the provided `title` and `error`.

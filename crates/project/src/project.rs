@@ -2511,6 +2511,17 @@ impl Project {
     }
 
     #[inline]
+    pub fn restore_entry(
+        &mut self,
+        trash_entry: TrashedEntry,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<Option<ProjectPath>>>> {
+        // TODO!(yara) do we need this?
+        // cx.emit(Event::RestoreEntry(worktree.read(cx).id(), entry_id));
+        worktree.update(cx, |worktree, cx| worktree.restore_entry(trash_entry, cx))
+    }
+
+    #[inline]
     pub fn expand_entry(
         &mut self,
         worktree_id: WorktreeId,

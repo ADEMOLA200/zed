@@ -172,10 +172,10 @@ pub trait Fs: Send + Sync {
 
     /// Restores a given `TrashedEntry`, moving it from the system's trash back
     /// to the original path.
-    async fn restore(
+    fn restore(
         &self,
         trashed_entry: TrashedEntry,
-    ) -> std::result::Result<(), TrashRestoreError>;
+    ) -> std::result::Result<PathBuf, TrashRestoreError>;
 
     #[cfg(feature = "test-support")]
     fn as_fake(&self) -> Arc<FakeFs> {
@@ -192,9 +192,9 @@ pub struct TrashedEntry {
     /// * macOS & Windows – Full path to the file/directory in the system's
     /// trash.
     pub id: OsString,
-    // Original name of the file/directory before it was moved to the trash.
+    /// Name of the file/directory at the time of trashing, including extension.
     pub name: OsString,
-    // Original parent directory.
+    /// Absolute path to the parent directory at the time of trashing.
     pub original_parent: PathBuf,
 }
 
@@ -798,12 +798,32 @@ impl Fs for RealFs {
         }
     }
 
+    // TODO(yara) blocking -> async here or where it's used?
+    // Note this is done the other way round for restore... so we need to align that
     async fn trash_file(&self, path: &Path, _options: RemoveOptions) -> Result<TrashedEntry> {
-        Ok(trash::delete_with_info(path)?.into())
+        // We must make the path absolute or trash will make a wierd abonimation
+        // of the zed working directory (not usually the worktree) and whatever
+        // the path variable holds.
+        let path = self
+            .canonicalize(path)
+            .await
+            .context("Could not canonicalize the path of the file")?;
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::Builder::new()
+            .name("trash file or dir".to_string())
+            .spawn(|| tx.send(trash::delete_with_info(path)))
+            .context("Failed to spawn thread")?;
+
+        Ok(rx
+            .await
+            .context("Tx dropped or fs.restore panicked")?
+            .context("Could not trash file or dir")?
+            .into())
     }
 
     async fn trash_dir(&self, path: &Path, options: RemoveOptions) -> Result<TrashedEntry> {
-        self.trash_file(path, options).await
+        self.trash_file(path, options).await // TODO(yara): deduplicate make one trash method.
     }
 
     async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>> {
@@ -1252,11 +1272,13 @@ impl Fs for RealFs {
         res
     }
 
-    async fn restore(
+    fn restore(
         &self,
         trashed_entry: TrashedEntry,
-    ) -> std::result::Result<(), TrashRestoreError> {
-        trash::restore_all([trashed_entry.into_trash_item()]).map_err(Into::into)
+    ) -> std::result::Result<PathBuf, TrashRestoreError> {
+        let restored_item_path = trashed_entry.original_parent.join(&trashed_entry.name);
+        trash::restore_all([trashed_entry.into_trash_item()])?;
+        Ok(restored_item_path)
     }
 }
 
@@ -2964,10 +2986,10 @@ impl Fs for FakeFs {
         receiver
     }
 
-    async fn restore(
+    fn restore(
         &self,
         trashed_entry: TrashedEntry,
-    ) -> std::result::Result<(), TrashRestoreError> {
+    ) -> std::result::Result<PathBuf, TrashRestoreError> {
         let mut state = self.state.lock();
 
         let Some((trashed_entry, fake_entry)) = state
@@ -2998,7 +3020,7 @@ impl Fs for FakeFs {
         match result {
             Ok(_) => {
                 state.trash.retain(|(entry, _)| *entry != trashed_entry);
-                Ok(())
+                Ok(path)
             }
             Err(_) => {
                 // For now we'll just assume that this failed because it was a

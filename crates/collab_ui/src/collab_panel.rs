@@ -2348,55 +2348,49 @@ impl CollabPanel {
         let status = *self.client.status().borrow();
         let is_busy = status.is_signing_in();
 
-        let (button_id, button_label, button_icon, helper_text) = if is_authenticated {
+        let (button_id, button_label, button_icon) = if is_authenticated {
             (
                 "connect",
                 if is_busy { "Connecting…" } else { "Connect" },
-                Icon::new(IconName::SignalHigh).color(Color::Muted),
-                "Connect to collaboration servers.",
+                IconName::Public,
             )
         } else {
             (
                 "sign_in",
-                if is_busy { "Signing in…" } else { "Sign in" },
-                Icon::new(IconName::Github).color(Color::Muted),
-                "Sign in to enable collaboration.",
+                if is_busy {
+                    "Signing in…"
+                } else {
+                    "Sign In with GitHub"
+                },
+                IconName::Github,
             )
         };
 
         v_flex()
-            .gap_6()
             .p_4()
+            .gap_4()
+            .size_full()
+            .text_center()
+            .justify_center()
             .child(Label::new(collab_blurb))
             .child(
-                v_flex()
-                    .gap_2()
-                    .child(
-                        Button::new(button_id, button_label)
-                            .start_icon(button_icon)
-                            .style(ButtonStyle::Filled)
-                            .full_width()
-                            .disabled(is_busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let client = this.client.clone();
-                                let workspace = this.workspace.clone();
-                                cx.spawn_in(window, async move |_, mut cx| {
-                                    client
-                                        .connect(true, &mut cx)
-                                        .await
-                                        .into_response()
-                                        .notify_workspace_async_err(workspace, &mut cx);
-                                })
-                                .detach()
-                            })),
-                    )
-                    .child(
-                        v_flex().w_full().items_center().child(
-                            Label::new(helper_text)
-                                .color(Color::Muted)
-                                .size(LabelSize::Small),
-                        ),
-                    ),
+                Button::new(button_id, button_label)
+                    .full_width()
+                    .start_icon(Icon::new(button_icon).color(Color::Muted))
+                    .style(ButtonStyle::Outlined)
+                    .disabled(is_busy)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let client = this.client.clone();
+                        let workspace = this.workspace.clone();
+                        cx.spawn_in(window, async move |_, mut cx| {
+                            client
+                                .connect(true, &mut cx)
+                                .await
+                                .into_response()
+                                .notify_workspace_async_err(workspace, &mut cx);
+                        })
+                        .detach()
+                    })),
             )
     }
 

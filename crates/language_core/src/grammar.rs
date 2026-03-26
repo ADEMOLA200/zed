@@ -48,6 +48,16 @@ pub struct Grammar {
 pub struct HighlightsConfig {
     pub query: Query,
     pub identifier_capture_indices: Vec<u32>,
+    pub fallback_patterns: Vec<Option<FallbackHighlightName>>,
+}
+
+#[derive(Default)]
+pub struct FallbackHighlightName(Box<str>);
+
+impl AsRef<str> for FallbackHighlightName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
 }
 
 pub struct IndentConfig {
@@ -380,8 +390,7 @@ impl Grammar {
     pub fn with_highlights_query(mut self, source: &str) -> Result<Self> {
         let query = Query::new(&self.ts_language, source)?;
 
-        let mut identifier_capture_indices = Vec::new();
-        for name in [
+        let identifier_capture_indices = [
             "variable",
             "constant",
             "constructor",
@@ -392,13 +401,27 @@ impl Grammar {
             "property",
             "type",
             "type.interface",
-        ] {
-            identifier_capture_indices.extend(query.capture_index_for_name(name));
-        }
+        ]
+        .iter()
+        .filter_map(|name| query.capture_index_for_name(name))
+        .collect();
+
+        let fallback_patterns = (0..query.pattern_count())
+            .map(|ix| {
+                query
+                    .property_settings(ix)
+                    .iter()
+                    .find_map(|setting| match setting.key.as_ref() {
+                        "highlight.fallback" => setting.value.clone().map(FallbackHighlightName),
+                        _ => None,
+                    })
+            })
+            .collect();
 
         self.highlights_config = Some(HighlightsConfig {
             query,
             identifier_capture_indices,
+            fallback_patterns,
         });
 
         Ok(self)

@@ -119,19 +119,27 @@ fn bench_build_highlight_map(c: &mut Criterion) {
     let mut group = c.benchmark_group("build_highlight_map");
 
     for (capture_label, capture_names) in [
-        ("small_captures", SMALL_CAPTURE_NAMES as &[&str]),
-        ("large_captures", LARGE_CAPTURE_NAMES as &[&str]),
+        ("small_captures", SMALL_CAPTURE_NAMES),
+        ("large_captures", LARGE_CAPTURE_NAMES),
     ] {
+        let fallbacks = capture_names.into_iter().map(|_| None).collect::<Vec<_>>();
+
         for (theme_label, theme_keys) in [
-            ("small_theme", SMALL_THEME_KEYS as &[&str]),
-            ("large_theme", LARGE_THEME_KEYS as &[&str]),
+            ("small_theme", SMALL_THEME_KEYS),
+            ("large_theme", LARGE_THEME_KEYS),
         ] {
             let theme = syntax_theme(theme_keys);
             group.bench_with_input(
                 BenchmarkId::new(capture_label, theme_label),
-                &(capture_names, &theme),
-                |b, (capture_names, theme)| {
-                    b.iter(|| build_highlight_map(black_box(capture_names), black_box(theme)));
+                &(capture_names, &fallbacks, &theme),
+                |b, (capture_names, fallbacks, theme)| {
+                    b.iter(|| {
+                        build_highlight_map(
+                            black_box(capture_names),
+                            black_box(fallbacks.as_slice()),
+                            black_box(theme),
+                        )
+                    });
                 },
             );
         }

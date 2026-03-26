@@ -34,6 +34,7 @@ use futures::lock::OwnedMutexGuard;
 use gpui::{App, AsyncApp, Entity};
 use http_client::HttpClient;
 
+use language_core::FallbackHighlightName;
 pub use language_core::highlight_map::{HighlightId, HighlightMap};
 
 pub use language_core::{
@@ -1051,8 +1052,11 @@ impl Language {
         if let Some(grammar) = self.grammar.as_ref()
             && let Some(highlights_config) = &grammar.highlights_config
         {
-            *grammar.highlight_map.lock() =
-                build_highlight_map(highlights_config.query.capture_names(), theme);
+            *grammar.highlight_map.lock() = build_highlight_map(
+                highlights_config.query.capture_names(),
+                highlights_config.fallback_patterns.as_slice(),
+                theme,
+            );
         }
     }
 
@@ -1081,12 +1085,23 @@ impl Language {
 }
 
 #[inline]
-pub fn build_highlight_map(capture_names: &[&str], theme: &SyntaxTheme) -> HighlightMap {
-    HighlightMap::from_ids(capture_names.iter().map(|capture_name| {
-        theme
-            .highlight_id(capture_name)
-            .map_or(HighlightId::default(), HighlightId)
-    }))
+pub fn build_highlight_map(
+    capture_names: &[&str],
+    fallback_capture_names: &[Option<FallbackHighlightName>],
+    theme: &SyntaxTheme,
+) -> HighlightMap {
+    HighlightMap::from_ids(capture_names.iter().zip(fallback_capture_names).map(
+        |(capture_name, fallback_capture_name)| {
+            theme
+                .highlight_id(capture_name)
+                .or_else(|| {
+                    fallback_capture_name
+                        .as_ref()
+                        .and_then(|capture_name| theme.highlight_id(capture_name.as_ref()))
+                })
+                .map_or(HighlightId::default(), HighlightId)
+        },
+    ))
 }
 
 impl LanguageScope {
@@ -1652,7 +1667,9 @@ mod tests {
             "variable.builtin.self",
         ];
 
-        let map = build_highlight_map(capture_names, &theme);
+        let fallbacks = capture_names.map(|_| None);
+
+        let map = build_highlight_map(capture_names, &fallbacks, &theme);
         assert_eq!(theme.get_capture_name(map.get(0)), Some("function"));
         assert_eq!(theme.get_capture_name(map.get(1)), Some("function.async"));
         assert_eq!(theme.get_capture_name(map.get(2)), Some("variable.builtin"));

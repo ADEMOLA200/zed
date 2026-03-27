@@ -86,6 +86,7 @@ struct ChannelMoveClipboard {
 
 const COLLABORATION_PANEL_KEY: &str = "CollaborationPanel";
 const TOAST_DURATION: Duration = Duration::from_secs(5);
+const MARK_AS_READ_DELAY: Duration = Duration::from_secs(1);
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -246,6 +247,7 @@ pub struct CollabPanel {
     workspace: WeakEntity<Workspace>,
     notification_store: Entity<NotificationStore>,
     current_notification_toast: Option<(u64, Task<()>)>,
+    mark_as_read_tasks: HashMap<u64, Task<anyhow::Result<()>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -373,6 +375,7 @@ impl CollabPanel {
                 channel_store: ChannelStore::global(cx),
                 notification_store: NotificationStore::global(cx),
                 current_notification_toast: None,
+                mark_as_read_tasks: HashMap::default(),
                 user_store: workspace.user_store().clone(),
                 project: workspace.project().clone(),
                 subscriptions: Vec::default(),
@@ -3154,6 +3157,14 @@ impl CollabPanel {
         );
 
         let notification_id = entry.id;
+        let accepted_notification_id =
+            matches!(notification, Notification::ContactRequestAccepted { .. })
+                .then_some(notification_id);
+
+        if let Some(notification_id) = accepted_notification_id {
+            self.mark_notification_read(notification_id, cx);
+        }
+
         self.current_notification_toast = Some((
             notification_id,
             cx.spawn(async move |this, cx| {
@@ -3163,8 +3174,7 @@ impl CollabPanel {
             }),
         ));
 
-        let user_store = self.user_store.clone();
-        let channel_store = self.channel_store.clone();
+        let collab_panel = cx.entity().downgrade();
         self.workspace
             .update(cx, |workspace, cx| {
                 let id = NotificationId::unique::<CollabNotificationToast>();
@@ -3176,14 +3186,34 @@ impl CollabPanel {
                         actor,
                         text,
                         notification: needs_response.then(|| notification),
-                        user_store: user_store.clone(),
-                        channel_store: channel_store.clone(),
+                        accepted_notification_id,
                         workspace,
+                        collab_panel: collab_panel.clone(),
                         focus_handle: cx.focus_handle(),
                     })
                 })
             })
             .ok();
+    }
+
+    fn mark_notification_read(&mut self, notification_id: u64, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        self.mark_as_read_tasks
+            .entry(notification_id)
+            .or_insert_with(|| {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(MARK_AS_READ_DELAY).await;
+                    client
+                        .request(proto::MarkNotificationRead { notification_id })
+                        .await?;
+
+                    this.update(cx, |this, _| {
+                        this.mark_as_read_tasks.remove(&notification_id);
+                    })?;
+
+                    Ok(())
+                })
+            });
     }
 
     fn remove_toast(&mut self, notification_id: u64, cx: &mut Context<Self>) {
@@ -3543,9 +3573,9 @@ pub struct CollabNotificationToast {
     actor: Option<Arc<User>>,
     text: String,
     notification: Option<Notification>,
-    user_store: Entity<UserStore>,
-    channel_store: Entity<ChannelStore>,
+    accepted_notification_id: Option<u64>,
     workspace: WeakEntity<Workspace>,
+    collab_panel: WeakEntity<CollabPanel>,
     focus_handle: FocusHandle,
 }
 
@@ -3569,27 +3599,31 @@ impl CollabNotificationToast {
         })
     }
 
-    fn respond(&mut self, accept: bool, cx: &mut Context<Self>) {
+    fn respond(&mut self, accept: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(notification) = self.notification.take() {
-            match notification {
-                Notification::ContactRequest { sender_id } => {
-                    self.user_store
-                        .update(cx, |store, cx| {
-                            store.respond_to_contact_request(sender_id, accept, cx)
-                        })
-                        .detach();
-                }
-                Notification::ChannelInvitation { channel_id, .. } => {
-                    self.channel_store
-                        .update(cx, |store, cx| {
-                            store.respond_to_channel_invite(ChannelId(channel_id), accept, cx)
-                        })
-                        .detach();
-                }
-                _ => {}
-            }
+            self.collab_panel
+                .update(cx, |collab_panel, cx| match notification {
+                    Notification::ContactRequest { sender_id } => {
+                        collab_panel.respond_to_contact_request(sender_id, accept, window, cx);
+                    }
+                    Notification::ChannelInvitation { channel_id, .. } => {
+                        collab_panel.respond_to_channel_invite(ChannelId(channel_id), accept, cx);
+                    }
+                    Notification::ContactRequestAccepted { .. } => {}
+                })
+                .ok();
         }
         cx.emit(DismissEvent);
+    }
+
+    fn mark_accepted_notification_read(&self, cx: &mut Context<Self>) {
+        if let Some(notification_id) = self.accepted_notification_id {
+            self.collab_panel
+                .update(cx, |collab_panel, cx| {
+                    collab_panel.mark_notification_read(notification_id, cx);
+                })
+                .ok();
+        }
     }
 }
 
@@ -3598,8 +3632,9 @@ impl Render for CollabNotificationToast {
         let needs_response = self.notification.is_some();
 
         let accept_button = if needs_response {
-            Button::new("accept", "Accept").on_click(cx.listener(|this, _, _, cx| {
-                this.respond(true, cx);
+            Button::new("accept", "Accept").on_click(cx.listener(|this, _, window, cx| {
+                this.respond(true, window, cx);
+                cx.stop_propagation();
             }))
         } else {
             Button::new("dismiss", "Dismiss").on_click(cx.listener(|_, _, _, cx| {
@@ -3608,11 +3643,13 @@ impl Render for CollabNotificationToast {
         };
 
         let decline_button = if needs_response {
-            Button::new("decline", "Decline").on_click(cx.listener(|this, _, _, cx| {
-                this.respond(false, cx);
+            Button::new("decline", "Decline").on_click(cx.listener(|this, _, window, cx| {
+                this.respond(false, window, cx);
+                cx.stop_propagation();
             }))
         } else {
-            Button::new("close", "Close").on_click(cx.listener(|_, _, _, cx| {
+            Button::new("close", "Close").on_click(cx.listener(|this, _, _, cx| {
+                this.mark_accepted_notification_read(cx);
                 cx.emit(DismissEvent);
             }))
         };
@@ -3626,6 +3663,7 @@ impl Render for CollabNotificationToast {
         div()
             .id("collab_notification_toast")
             .on_click(cx.listener(|this, _, window, cx| {
+                this.mark_accepted_notification_read(cx);
                 this.focus_collab_panel(window, cx);
                 cx.emit(DismissEvent);
             }))

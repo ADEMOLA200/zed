@@ -54,6 +54,10 @@ gpui::actions!(
         NewThreadInGroup,
         /// Toggles between the thread list and the archive view.
         ToggleArchive,
+        /// Closes the currently selected workspace.
+        RemoveSelectedWorkspace,
+        /// Removes the selected entry: archives a thread or closes a workspace.
+        RemoveSelected,
     ]
 );
 
@@ -2453,6 +2457,43 @@ impl Sidebar {
         self.archive_thread(&session_id, window, cx);
     }
 
+    fn remove_selected_workspace(
+        &mut self,
+        _: &RemoveSelectedWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.selection else {
+            return;
+        };
+        let Some(ListEntry::ProjectHeader { workspace, .. }) = self.contents.entries.get(ix)
+        else {
+            return;
+        };
+        let workspace = workspace.clone();
+        self.remove_workspace(&workspace, window, cx);
+    }
+
+    fn remove_selected(
+        &mut self,
+        _: &RemoveSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.selection else {
+            return;
+        };
+        match self.contents.entries.get(ix) {
+            Some(ListEntry::Thread(_)) => {
+                self.remove_selected_thread(&RemoveSelectedThread, window, cx);
+            }
+            Some(ListEntry::ProjectHeader { .. }) => {
+                self.remove_selected_workspace(&RemoveSelectedWorkspace, window, cx);
+            }
+            _ => {}
+        }
+    }
+
     fn render_thread(
         &self,
         ix: usize,
@@ -3160,6 +3201,8 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::remove_selected_thread))
+            .on_action(cx.listener(Self::remove_selected_workspace))
+            .on_action(cx.listener(Self::remove_selected))
             .on_action(cx.listener(Self::new_thread_in_group))
             .on_action(cx.listener(Self::toggle_archive))
             .on_action(cx.listener(Self::focus_sidebar_filter))

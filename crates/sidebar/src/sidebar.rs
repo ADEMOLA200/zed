@@ -2474,20 +2474,14 @@ impl Sidebar {
         let Some(ix) = self.selection else {
             return;
         };
-        let Some(ListEntry::ProjectHeader { workspace, .. }) = self.contents.entries.get(ix)
-        else {
+        let Some(ListEntry::ProjectHeader { workspace, .. }) = self.contents.entries.get(ix) else {
             return;
         };
         let workspace = workspace.clone();
         self.remove_workspace(&workspace, window, cx);
     }
 
-    fn remove_selected(
-        &mut self,
-        _: &RemoveSelected,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn remove_selected(&mut self, _: &RemoveSelected, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.selection else {
             return;
         };
@@ -2530,15 +2524,15 @@ impl Sidebar {
 
         let workspace = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { workspace, .. }) => Some(workspace.clone()),
-            Some(ListEntry::Thread(_) | ListEntry::ViewMore { .. } | ListEntry::NewThread { .. }) => {
-                self.contents.entries[..ix]
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        ListEntry::ProjectHeader { workspace, .. } => Some(workspace.clone()),
-                        _ => None,
-                    })
-            }
+            Some(
+                ListEntry::Thread(_) | ListEntry::ViewMore { .. } | ListEntry::NewThread { .. },
+            ) => self.contents.entries[..ix]
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    ListEntry::ProjectHeader { workspace, .. } => Some(workspace.clone()),
+                    _ => None,
+                }),
             _ => None,
         };
 
@@ -2571,15 +2565,15 @@ impl Sidebar {
 
         let path_list = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { path_list, .. }) => Some(path_list.clone()),
-            Some(ListEntry::Thread(_) | ListEntry::ViewMore { .. } | ListEntry::NewThread { .. }) => {
-                self.contents.entries[..ix]
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        ListEntry::ProjectHeader { path_list, .. } => Some(path_list.clone()),
-                        _ => None,
-                    })
-            }
+            Some(
+                ListEntry::Thread(_) | ListEntry::ViewMore { .. } | ListEntry::NewThread { .. },
+            ) => self.contents.entries[..ix]
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    ListEntry::ProjectHeader { path_list, .. } => Some(path_list.clone()),
+                    _ => None,
+                }),
             _ => None,
         };
 
@@ -2602,15 +2596,15 @@ impl Sidebar {
 
         let path_list = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { path_list, .. }) => Some(path_list.clone()),
-            Some(ListEntry::Thread(_) | ListEntry::ViewMore { .. } | ListEntry::NewThread { .. }) => {
-                self.contents.entries[..ix]
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        ListEntry::ProjectHeader { path_list, .. } => Some(path_list.clone()),
-                        _ => None,
-                    })
-            }
+            Some(
+                ListEntry::Thread(_) | ListEntry::ViewMore { .. } | ListEntry::NewThread { .. },
+            ) => self.contents.entries[..ix]
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    ListEntry::ProjectHeader { path_list, .. } => Some(path_list.clone()),
+                    _ => None,
+                }),
             _ => None,
         };
 

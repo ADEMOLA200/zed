@@ -121,7 +121,6 @@ async fn save_thread_metadata(
         updated_at,
         created_at: None,
         folder_paths: path_list,
-        archived: false,
     };
     cx.update(|cx| {
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx))
@@ -4194,7 +4193,6 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
                         chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
                     ),
                     folder_paths: path_list.clone(),
-                    archived: false,
                 },
                 cx,
             )
@@ -4222,7 +4220,6 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
                         chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 2, 0, 0, 0).unwrap(),
                     ),
                     folder_paths: path_list.clone(),
-                    archived: false,
                 },
                 cx,
             )
@@ -4250,7 +4247,6 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
                         chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 3, 0, 0, 0).unwrap(),
                     ),
                     folder_paths: path_list.clone(),
-                    archived: false,
                 },
                 cx,
             )
@@ -4362,7 +4358,6 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
                         chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 6, 1, 0, 0, 0).unwrap(),
                     ),
                     folder_paths: path_list.clone(),
-                    archived: false,
                 },
                 cx,
             )
@@ -4414,7 +4409,6 @@ async fn test_thread_switcher_ordering(cx: &mut TestAppContext) {
                         chrono::TimeZone::with_ymd_and_hms(&Utc, 2023, 6, 1, 0, 0, 0).unwrap(),
                     ),
                     folder_paths: path_list.clone(),
-                    archived: false,
                 },
                 cx,
             )
@@ -4526,9 +4520,12 @@ async fn test_archived_threads_excluded_from_sidebar_entries(cx: &mut TestAppCon
             updated_at: chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
             created_at: None,
             folder_paths: path_list.clone(),
-            archived: true,
         };
-        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            let session_id = metadata.session_id.clone();
+            store.save(metadata, cx);
+            store.archive(&session_id, cx);
+        });
     });
     cx.run_until_parked();
 
@@ -4708,7 +4705,6 @@ mod property_test {
             updated_at,
             created_at: None,
             folder_paths: path_list,
-            archived: false,
         };
         cx.update(|_, cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));

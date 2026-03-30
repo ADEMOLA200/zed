@@ -163,7 +163,7 @@ impl ThreadImportModal {
                 Ok(threads) => {
                     let imported_count = threads.len();
                     ThreadMetadataStore::global(cx)
-                        .update(cx, |store, cx| store.save_all(threads, cx));
+                        .update(cx, |store, cx| store.save_all_to_archive(threads, cx));
                     this.is_importing = false;
                     this.last_error = None;
                     this.show_imported_threads_toast(imported_count, cx);
@@ -468,7 +468,6 @@ fn collect_importable_threads(
                 updated_at: session.updated_at.unwrap_or_else(|| Utc::now()),
                 created_at: session.created_at,
                 folder_paths,
-                archived: true,
             });
         }
     }

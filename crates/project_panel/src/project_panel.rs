@@ -2206,7 +2206,10 @@ impl ProjectPanel {
     }
 
     pub fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
-        self.undo_manager.undo(cx);
+        cx.spawn(|_, cx| async {
+            self.undo_manager.undo(cx).await;
+        })
+        .detach_and_log_err(cx);
         cx.notify();
     }
 

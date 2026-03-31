@@ -6620,6 +6620,7 @@ dependencies = [
  "smol",
  "tempfile",
  "text",
+ "thiserror 2.0.17",
  "time",
  "trash",
  "util",

@@ -26,7 +26,7 @@ use git::{
 };
 use gpui::{
     App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Priority,
-    Task,
+    Task, WeakEntity,
 };
 use ignore::IgnoreStack;
 use language::DiskState;
@@ -835,15 +835,38 @@ impl Worktree {
         Some(task)
     }
 
-    pub fn restore_entry(
-        &mut self,
+    // good mental model for async
+    //
+    // Every async function is divided into blocks. An async function
+    // with 2 await points is turned into 3 blocks:
+    // - before the first await
+    // - between the first and second
+    // - after the second await
+    //
+    // A task is an async function that can execute concurrently with every
+    // other task. It is created from a normal async function and an executor.
+    //
+    // Every code block in a task needs to be able to run concurrently with
+    // every code block in every other task that could possibly run at the same time.
+    //
+    // If the first block of code gets a mutable borrow to something outside the
+    // task and the borrow is kept until the second then that mutable borrow
+    // could be held while another piece of code (from another task) runs and
+    // also access that same area of memory. This is unsafe and so the compiler
+    // will safe you from it
+
+    pub async fn restore_entry(
+        &self,
         trash_entry: TrashedEntry,
-        cx: &mut Context<Worktree>,
-    ) -> Task<Result<RelPathBuf>> {
+        cx: &Context<'_, Worktree>,
+    ) -> Result<RelPathBuf> {
         match self {
-            Worktree::Local(this) => this.restore_entry(trash_entry, cx),
+            Worktree::Local(this) => {
+                this.restore_entry(trash_entry, cx.entity(), cx.to_async)
+                    .await
+            }
             // TODO!(dino): Add support for restoring entries in remote worktrees.
-            Worktree::Remote(_this) => Task::ready(Err(anyhow!("Unsupported"))),
+            Worktree::Remote(_this) => Err(anyhow!("Unsupported")),
         }
 
         // TODO(yara) do we need to emit events, test and see if it works without doing that.
@@ -1666,27 +1689,29 @@ impl LocalWorktree {
         }))
     }
 
-    pub fn restore_entry(
+    pub async fn restore_entry(
         &self,
         trash_entry: TrashedEntry,
-        cx: &Context<Worktree>,
-    ) -> Task<Result<RelPathBuf>> {
+        worktree: WeakEntity<Worktree>,
+        cx: AsyncApp,
+    ) -> Result<RelPathBuf> {
         let fs = self.fs.clone();
         let path_style = self.path_style();
 
-        cx.spawn(async move |this, cx| {
-            let path_buf = fs.restore(trash_entry).await?;
+        let worktree = cx.weak_entity();
+        let worktree = worktree.upgrade().unwrap();
+        let path_buf = fs.restore(trash_entry).await?;
 
-            this.update(cx, |this, _| {
-                let path = path_buf
-                    .strip_prefix(this.abs_path())
-                    .context("Could not strip prefix")?;
-                let path = RelPath::new(&path, path_style)?;
-                let path = path.into_owned();
-                Ok(path)
-            })
-            .flatten()
-        })
+        let worktree_abs_path: Arc<Path> =
+            cx.read_entity::<Worktree, _>(&worktree, |this, _| this.abs_path());
+
+        let path = path_buf
+            .strip_prefix(worktree_abs_path)
+            .context("Could not strip prefix")?;
+        let path = RelPath::new(&path, path_style)?;
+        let path = path.into_owned();
+
+        Ok(path)
     }
 
     pub fn copy_external_entries(

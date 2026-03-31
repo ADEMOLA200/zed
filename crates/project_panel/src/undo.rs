@@ -104,7 +104,7 @@
 use crate::ProjectPanel;
 use anyhow::{Result, anyhow};
 use fs::TrashedEntry;
-use gpui::{AppContext, SharedString, Task, WeakEntity};
+use gpui::{AppContext, AsyncApp, SharedString, Task, WeakEntity};
 use project::{ProjectPath, WorktreeId};
 use std::collections::VecDeque;
 use ui::App;
@@ -123,7 +123,7 @@ enum Operation {
 }
 
 impl Operation {
-    async fn execute(self, undo_manager: &UndoManager, cx: &mut App) -> Result<Change> {
+    async fn execute(self, undo_manager: &UndoManager, cx: &mut AsyncApp) -> Result<Change> {
         Ok(match self {
             Operation::Create(project_path) => {
                 undo_manager.create(&project_path, cx).await?;
@@ -225,7 +225,7 @@ impl UndoManager {
         self.cursor < self.history.len()
     }
 
-    pub async fn undo(&mut self, cx: &mut App) -> Result<()> {
+    pub async fn undo(&mut self, cx: &mut AsyncApp) -> Result<()> {
         if !self.can_undo() {
             return Ok(());
         }
@@ -325,7 +325,7 @@ impl UndoManager {
         &self,
         from: &ProjectPath,
         to: &ProjectPath,
-        cx: &mut App,
+        cx: &mut AsyncApp,
     ) -> Result<CreatedEntry> {
         let Some(workspace) = self.workspace.upgrade() else {
             return Err(anyhow!("Failed to obtain workspace."));
@@ -345,7 +345,7 @@ impl UndoManager {
         res?.await
     }
 
-    async fn create(&self, project_path: &ProjectPath, cx: &mut App) -> Result<CreatedEntry> {
+    async fn create(&self, project_path: &ProjectPath, cx: &mut AsyncApp) -> Result<CreatedEntry> {
         let Some(workspace) = self.workspace.upgrade() else {
             return Err(anyhow!("Failed to obtain workspace."));
         };
@@ -394,7 +394,7 @@ impl UndoManager {
         &self,
         worktree_id: WorktreeId,
         trashed_entry: TrashedEntry,
-        cx: &mut App,
+        cx: &mut AsyncApp,
     ) -> Result<ProjectPath> {
         let Some(workspace) = self.workspace.upgrade() else {
             return Err(anyhow!("Failed to obtain workspace."));
@@ -408,6 +408,20 @@ impl UndoManager {
             })
             .await
     }
+
+    // async fn {
+    //     // access some data in gpui mutable
+    //     await <- scheduler could go do something else that also accesses that data
+    //     // do something with that data
+    // }
+
+    // fn -> Task {
+    //     access some data muta
+    //     cx.spawn({
+    //         asyncthing.await
+    //         // do something with data
+    //     }
+    // }
 
     /// Displays a notification with the provided `title` and `error`.
     fn show_error(

@@ -2392,54 +2392,25 @@ impl Sidebar {
                     }
                 }
 
-                // Now resolve the branch name. After the reset, HEAD is at
-                // the parent of the WIP commit.
-                let head_sha_receiver = worktree_repo.update(cx, |repo, _cx| repo.head_sha());
-                let current_head = match head_sha_receiver.await {
-                    Ok(Ok(Some(sha))) => Some(sha),
-                    _ => None,
-                };
-
-                // Try to put the worktree on the original branch name.
-                let original_branch = row.branch_name.clone().unwrap_or_default();
-                let branches_receiver = main_repo.update(cx, |repo, _cx| repo.branches());
-                let branches = match branches_receiver.await {
-                    Ok(Ok(branches)) => branches,
-                    _ => Vec::new(),
-                };
-
-                let existing_branch = branches
-                    .iter()
-                    .find(|b| b.name() == original_branch.as_str() && !b.is_remote());
-
-                let branch_exists_and_is_ours = existing_branch.is_some()
-                    && current_head.as_ref().is_some_and(|head| {
-                        existing_branch
-                            .and_then(|b| b.most_recent_commit.as_ref())
-                            .is_some_and(|commit| commit.sha.as_ref() == head.as_str())
-                    });
-
-                let branch_exists = existing_branch.is_some();
-
-                if branch_exists_and_is_ours {
-                    // Branch exists and points to the right commit — switch to it.
-                    let receiver = worktree_repo
+                // Try to put the worktree back on its original branch.
+                if let Some(original_branch) = &row.branch_name {
+                    // First try switching to the branch — this works when
+                    // the branch still exists and its tip matches HEAD.
+                    let switch_receiver = worktree_repo
                         .update(cx, |repo, _cx| repo.change_branch(original_branch.clone()));
-                    if let Ok(result) = receiver.await {
-                        result.log_err();
-                    }
-                } else if !branch_exists {
-                    // Branch doesn't exist — create it at current HEAD.
-                    let receiver = worktree_repo.update(cx, |repo, _cx| {
-                        repo.create_branch(original_branch.clone(), None)
-                    });
-                    if let Ok(result) = receiver.await {
-                        result.log_err();
+                    let switch_ok = matches!(switch_receiver.await, Ok(Ok(())));
+
+                    if !switch_ok {
+                        // Branch doesn't exist or can't be checked out from
+                        // our current HEAD — create a new branch here.
+                        let create_receiver = worktree_repo.update(cx, |repo, _cx| {
+                            repo.create_branch(original_branch.clone(), None)
+                        });
+                        if let Ok(result) = create_receiver.await {
+                            result.log_err();
+                        }
                     }
                 }
-                // If branch exists but points elsewhere (collision), leave
-                // the worktree in detached HEAD. The user can create a
-                // branch manually.
             }
 
             // Mark the archived worktree as restored in the database.

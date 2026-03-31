@@ -2511,23 +2511,27 @@ impl Project {
     }
 
     #[inline]
-    pub async fn restore_entry(
-        &mut self,
+    pub fn restore_entry(
+        &self,
         worktree_id: WorktreeId,
         trash_entry: TrashedEntry,
         cx: &mut Context<'_, Self>,
-    ) -> Result<ProjectPath> {
+    ) -> Task<Result<ProjectPath>> {
         let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
-            return Err(anyhow!("No worktree for id {worktree_id:?}"));
+            return Task::ready(Err(anyhow!("No worktree for id {worktree_id:?}")));
         };
 
-        worktree
-            .update(cx, |worktree, cx| worktree.restore_entry(trash_entry, cx))
-            .await
-            .map(|rel_path_buf| ProjectPath {
-                worktree_id: worktree_id,
-                path: Arc::from(rel_path_buf.as_rel_path()),
-            })
+        let weak_worktree = worktree.downgrade();
+        let cx_async = cx.to_async();
+
+        cx.spawn(async move |this, cx| {
+            Worktree::restore_entry(trash_entry, weak_worktree, cx_async)
+                .await
+                .map(|rel_path_buf| ProjectPath {
+                    worktree_id: worktree_id,
+                    path: Arc::from(rel_path_buf.as_rel_path()),
+                })
+        })
     }
 
     #[inline]

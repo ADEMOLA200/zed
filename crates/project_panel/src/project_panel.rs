@@ -161,7 +161,7 @@ pub struct ProjectPanel {
     sticky_items_count: usize,
     last_reported_update: Instant,
     update_visible_entries_task: UpdateVisibleEntriesTask,
-    undo_manager: UndoManager,
+    undo_manager: Entity<UndoManager>,
     state: State,
 }
 
@@ -865,6 +865,7 @@ impl ProjectPanel {
             .detach();
 
             let scroll_handle = UniformListScrollHandle::new();
+            let weak_project_panel = cx.weak_entity();
             let mut this = Self {
                 project: project.clone(),
                 hover_scroll_task: None,
@@ -902,7 +903,8 @@ impl ProjectPanel {
                     unfolded_dir_ids: Default::default(),
                 },
                 update_visible_entries_task: Default::default(),
-                undo_manager: UndoManager::new(workspace.weak_handle(), cx.weak_entity()),
+                undo_manager: cx
+                    .new(move |_| UndoManager::new(workspace.weak_handle(), weak_project_panel)),
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -1241,12 +1243,12 @@ impl ProjectPanel {
                             .action_disabled_when(!has_pasteable_content, "Paste", Box::new(Paste))
                             .when(cx.has_flag::<ProjectPanelUndoRedoFeatureFlag>(), |menu| {
                                 menu.action_disabled_when(
-                                    !self.undo_manager.can_undo(),
+                                    !self.undo_manager.read(cx).can_undo(),
                                     "Undo",
                                     Box::new(Undo),
                                 )
                                 .action_disabled_when(
-                                    !self.undo_manager.can_redo(),
+                                    !self.undo_manager.read(cx).can_redo(),
                                     "Redo",
                                     Box::new(Redo),
                                 )
@@ -1952,7 +1954,9 @@ impl ProjectPanel {
                     } else {
                         Change::Created(new_project_path)
                     };
-                    project_panel.undo_manager.record([operation]);
+                    project_panel
+                        .undo_manager
+                        .update(cx, |undo_manager, cx| undo_manager.record([operation]));
                 }
 
                 cx.notify();
@@ -2207,6 +2211,12 @@ impl ProjectPanel {
 
     pub fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn(|_, cx| async {
+            TODO(yara, dino)
+            If undo_manager is a gpui entity it gets really annoying to do async functions
+            as we can not hold a borrow of something inside the gpui Context
+            across await points. We want self so instead of putting undo
+            manager into gpui we put it on the heap in an Arc<Mutex>>. So we
+            lock that mutex here and call undo.await
             self.undo_manager.undo(cx).await;
         })
         .detach_and_log_err(cx);

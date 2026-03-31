@@ -835,38 +835,17 @@ impl Worktree {
         Some(task)
     }
 
-    // good mental model for async
-    //
-    // Every async function is divided into blocks. An async function
-    // with 2 await points is turned into 3 blocks:
-    // - before the first await
-    // - between the first and second
-    // - after the second await
-    //
-    // A task is an async function that can execute concurrently with every
-    // other task. It is created from a normal async function and an executor.
-    //
-    // Every code block in a task needs to be able to run concurrently with
-    // every code block in every other task that could possibly run at the same time.
-    //
-    // If the first block of code gets a mutable borrow to something outside the
-    // task and the borrow is kept until the second then that mutable borrow
-    // could be held while another piece of code (from another task) runs and
-    // also access that same area of memory. This is unsafe and so the compiler
-    // will safe you from it
-
     pub async fn restore_entry(
-        &self,
         trash_entry: TrashedEntry,
-        cx: &Context<'_, Worktree>,
+        worktree: WeakEntity<Self>,
+        cx: AsyncApp,
     ) -> Result<RelPathBuf> {
-        match self {
-            Worktree::Local(this) => {
-                this.restore_entry(trash_entry, cx.entity(), cx.to_async)
-                    .await
-            }
+        let is_local = worktree.read_with(&cx, |this, _| this.is_local())?;
+        if is_local {
+            LocalWorktree::restore_entry(trash_entry, worktree, cx).await
+        } else {
             // TODO!(dino): Add support for restoring entries in remote worktrees.
-            Worktree::Remote(_this) => Err(anyhow!("Unsupported")),
+            Err(anyhow!("Unsupported"))
         }
 
         // TODO(yara) do we need to emit events, test and see if it works without doing that.
@@ -1183,7 +1162,7 @@ impl LocalWorktree {
                 });
             }
         });
-        self._background_scanner_tasks = vec![background_scanner, scan_state_updater];
+        self._background_scanner_tasks = vec![];
         *self.is_scanning.0.borrow_mut() = true;
     }
 
@@ -1690,21 +1669,25 @@ impl LocalWorktree {
     }
 
     pub async fn restore_entry(
-        &self,
         trash_entry: TrashedEntry,
-        worktree: WeakEntity<Worktree>,
+        this: WeakEntity<Worktree>,
         cx: AsyncApp,
     ) -> Result<RelPathBuf> {
-        let fs = self.fs.clone();
-        let path_style = self.path_style();
+        let Some((fs, worktree_abs_path, path_style)) = this.read_with(&cx, |this, _cx| {
+            let local_worktree = match this {
+                Worktree::Local(local_worktree) => local_worktree,
+                Worktree::Remote(_) => return None,
+            };
 
-        let worktree = cx.weak_entity();
-        let worktree = worktree.upgrade().unwrap();
+            let fs = local_worktree.fs.clone();
+            let path_style = local_worktree.path_style();
+            Some((fs, Arc::clone(local_worktree.abs_path()), path_style))
+        })?
+        else {
+            return Err(anyhow!("Localworktree should not change into a remote one"));
+        };
+
         let path_buf = fs.restore(trash_entry).await?;
-
-        let worktree_abs_path: Arc<Path> =
-            cx.read_entity::<Worktree, _>(&worktree, |this, _| this.abs_path());
-
         let path = path_buf
             .strip_prefix(worktree_abs_path)
             .context("Could not strip prefix")?;

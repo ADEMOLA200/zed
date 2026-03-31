@@ -225,7 +225,7 @@ impl UndoManager {
         self.cursor < self.history.len()
     }
 
-    pub async fn undo(&mut self, cx: &mut AsyncApp) -> Result<()> {
+    pub async fn undo(cx: &mut AsyncApp) -> Result<()> {
         if !self.can_undo() {
             return Ok(());
         }
@@ -287,7 +287,10 @@ impl UndoManager {
             .remove(self.cursor)
             .expect("we can redo")
             .clone();
-        let redo_change = change_at_the_cursor.to_inverse().execute(self, cx).await?;
+        let redo_change = change_at_the_cursor
+            .to_inverse()
+            .execute(self, &mut cx.to_async())
+            .await?;
         self.history.insert(self.cursor, redo_change);
         self.cursor += 1;
         Ok(())
@@ -366,7 +369,7 @@ impl UndoManager {
             .await
     }
 
-    async fn trash(&self, project_path: &ProjectPath, cx: &mut App) -> Result<TrashedEntry> {
+    async fn trash(&self, project_path: &ProjectPath, cx: &mut AsyncApp) -> Result<TrashedEntry> {
         let Some(workspace) = self.workspace.upgrade() else {
             return Err(anyhow!("Failed to obtain workspace."));
         };

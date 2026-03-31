@@ -46,9 +46,9 @@ use agent_settings::{AgentProfileId, AgentSettings};
 use assistant_slash_command::SlashCommandRegistry;
 use client::Client;
 use command_palette_hooks::CommandPaletteFilter;
-use feature_flags::{AgentV2FeatureFlag, FeatureFlagAppExt as _};
+use feature_flags::FeatureFlagAppExt as _;
 use fs::Fs;
-use gpui::{Action, App, Context, Entity, SharedString, UpdateGlobal as _, Window, actions};
+use gpui::{Action, App, Context, Entity, SharedString, Window, actions};
 use language::{
     LanguageRegistry,
     language_settings::{AllLanguageSettings, EditPredictionProvider},
@@ -60,7 +60,7 @@ use project::{AgentId, DisableAiSettings};
 use prompt_store::PromptBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{DockPosition, DockSide, LanguageModelSelection, Settings as _, SettingsStore};
+use settings::{LanguageModelSelection, Settings as _, SettingsStore};
 use std::any::TypeId;
 use workspace::Workspace;
 
@@ -429,45 +429,10 @@ pub fn init(
     })
     .detach();
 
-    // TODO: remove this field when we're ready remove the feature flag
-    maybe_backfill_editor_layout(fs, is_new_install, false, cx);
-
-    cx.observe_flag::<AgentV2FeatureFlag, _>(|is_enabled, cx| {
-        SettingsStore::update_global(cx, |store, cx| {
-            store.update_default_settings(cx, |defaults| {
-                if is_enabled {
-                    defaults.agent.get_or_insert_default().dock = Some(DockPosition::Left);
-                    defaults.project_panel.get_or_insert_default().dock = Some(DockSide::Right);
-                    defaults.outline_panel.get_or_insert_default().dock = Some(DockSide::Right);
-                    defaults.collaboration_panel.get_or_insert_default().dock =
-                        Some(DockPosition::Right);
-                    defaults.git_panel.get_or_insert_default().dock = Some(DockPosition::Right);
-                    defaults.notification_panel.get_or_insert_default().button = Some(false);
-                } else {
-                    defaults.agent.get_or_insert_default().dock = Some(DockPosition::Right);
-                    defaults.project_panel.get_or_insert_default().dock = Some(DockSide::Left);
-                    defaults.outline_panel.get_or_insert_default().dock = Some(DockSide::Left);
-                    defaults.collaboration_panel.get_or_insert_default().dock =
-                        Some(DockPosition::Left);
-                    defaults.git_panel.get_or_insert_default().dock = Some(DockPosition::Left);
-                    defaults.notification_panel.get_or_insert_default().button = Some(true);
-                }
-            });
-        });
-    })
-    .detach();
+    maybe_backfill_editor_layout(fs, is_new_install, cx);
 }
 
-fn maybe_backfill_editor_layout(
-    fs: Arc<dyn Fs>,
-    is_new_install: bool,
-    should_run: bool,
-    cx: &mut App,
-) {
-    if !should_run {
-        return;
-    }
-
+fn maybe_backfill_editor_layout(fs: Arc<dyn Fs>, is_new_install: bool, cx: &mut App) {
     let kvp = db::kvp::KeyValueStore::global(cx);
     let already_backfilled =
         util::ResultExt::log_err(kvp.read_kvp(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY))
@@ -492,7 +457,6 @@ fn maybe_backfill_editor_layout(
 fn update_command_palette_filter(cx: &mut App) {
     let disable_ai = DisableAiSettings::get_global(cx).disable_ai;
     let agent_enabled = AgentSettings::get_global(cx).enabled;
-    let agent_v2_enabled = cx.has_flag::<AgentV2FeatureFlag>();
     let edit_prediction_provider = AllLanguageSettings::get_global(cx)
         .edit_predictions
         .provider;
@@ -561,11 +525,7 @@ fn update_command_palette_filter(cx: &mut App) {
             filter.show_action_types(&[TypeId::of::<zed_actions::OpenZedPredictOnboarding>()]);
         }
 
-        if agent_v2_enabled {
-            filter.show_namespace("multi_workspace");
-        } else {
-            filter.hide_namespace("multi_workspace");
-        }
+        filter.show_namespace("multi_workspace");
     });
 }
 
@@ -820,7 +780,6 @@ mod tests {
             cx.set_global(store);
             AgentSettings::register(cx);
             DisableAiSettings::register(cx);
-            cx.set_staff(true);
         });
 
         fs
@@ -838,7 +797,7 @@ mod tests {
                     .is_none()
             );
 
-            maybe_backfill_editor_layout(fs.clone(), false, true, cx);
+            maybe_backfill_editor_layout(fs.clone(), false, cx);
         });
 
         cx.run_until_parked();
@@ -857,7 +816,7 @@ mod tests {
         let fs = setup_backfill_test(cx).await;
 
         cx.update(|cx| {
-            maybe_backfill_editor_layout(fs.clone(), true, true, cx);
+            maybe_backfill_editor_layout(fs.clone(), true, cx);
         });
 
         cx.run_until_parked();
@@ -879,7 +838,7 @@ mod tests {
         let fs = setup_backfill_test(cx).await;
 
         cx.update(|cx| {
-            maybe_backfill_editor_layout(fs.clone(), false, true, cx);
+            maybe_backfill_editor_layout(fs.clone(), false, cx);
         });
 
         cx.run_until_parked();
@@ -887,7 +846,7 @@ mod tests {
         let after_first = fs.load(paths::settings_file().as_path()).await.unwrap();
 
         cx.update(|cx| {
-            maybe_backfill_editor_layout(fs.clone(), false, true, cx);
+            maybe_backfill_editor_layout(fs.clone(), false, cx);
         });
 
         cx.run_until_parked();

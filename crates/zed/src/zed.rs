@@ -2354,10 +2354,6 @@ mod tests {
     #[gpui::test]
     async fn test_open_paths_action(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
-        cx.update(|cx| {
-            use feature_flags::FeatureFlagAppExt as _;
-            cx.update_flags(false, vec!["agent-v2".to_string()]);
-        });
         app_state
             .fs
             .as_fake()
@@ -5317,10 +5313,6 @@ mod tests {
     #[gpui::test]
     async fn test_open_paths_switches_to_best_workspace(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
-        cx.update(|cx| {
-            use feature_flags::FeatureFlagAppExt as _;
-            cx.update_flags(false, vec!["agent-v2".to_string()]);
-        });
 
         app_state
             .fs
@@ -5517,10 +5509,6 @@ mod tests {
     async fn test_quit_checks_all_workspaces_for_dirty_items(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         cx.update(init);
-        cx.update(|cx| {
-            use feature_flags::FeatureFlagAppExt as _;
-            cx.update_flags(false, vec!["agent-v2".to_string()]);
-        });
 
         app_state
             .fs
@@ -5798,10 +5786,6 @@ mod tests {
 
         let app_state = init_test(cx);
 
-        cx.update(|cx| {
-            use feature_flags::FeatureFlagAppExt as _;
-            cx.update_flags(false, vec!["agent-v2".to_string()]);
-        });
 
         let dir1 = path!("/dir1");
         let dir2 = path!("/dir2");

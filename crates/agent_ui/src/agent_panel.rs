@@ -20,7 +20,6 @@ use project::AgentId;
 use serde::{Deserialize, Serialize};
 use settings::{LanguageModelProviderSetting, LanguageModelSelection};
 
-use feature_flags::{AgentV2FeatureFlag, FeatureFlagAppExt as _};
 use zed_actions::agent::{
     ConflictContent, OpenClaudeAgentOnboardingModal, ReauthenticateAgent,
     ResolveConflictedFilesWithAgent, ResolveConflictsWithAgent, ReviewBranchDiff,
@@ -876,13 +875,11 @@ impl AgentPanel {
                             panel.selected_agent_type = selected_agent;
                         }
                         if let Some(start_thread_in) = serialized_panel.start_thread_in {
-                            let is_worktree_flag_enabled =
-                                cx.has_flag::<AgentV2FeatureFlag>();
                             let is_valid = match &start_thread_in {
                                 StartThreadIn::LocalProject => true,
                                 StartThreadIn::NewWorktree => {
                                     let project = panel.project.read(cx);
-                                    is_worktree_flag_enabled && !project.is_via_collab()
+                                    !project.is_via_collab()
                                 }
                             };
                             if is_valid {
@@ -2262,10 +2259,6 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(action, StartThreadIn::NewWorktree) && !cx.has_flag::<AgentV2FeatureFlag>() {
-            return;
-        }
-
         let new_target = match *action {
             StartThreadIn::LocalProject => StartThreadIn::LocalProject,
             StartThreadIn::NewWorktree => {
@@ -4014,8 +4007,6 @@ impl AgentPanel {
             selected_agent.into_any_element()
         };
 
-        let show_history_menu = self.has_history_for_selected_agent(cx);
-        let has_v2_flag = cx.has_flag::<AgentV2FeatureFlag>();
         let is_empty_state = !self.active_thread_has_messages(cx);
 
         let is_in_history_or_config = matches!(
@@ -4027,8 +4018,7 @@ impl AgentPanel {
 
         let is_full_screen = self.is_zoomed(window, cx);
 
-        let use_v2_empty_toolbar =
-            has_v2_flag && is_empty_state && !is_in_history_or_config && !is_text_thread;
+        let use_v2_empty_toolbar = is_empty_state && !is_in_history_or_config && !is_text_thread;
 
         let base_container = h_flex()
             .id("agent-panel-toolbar")
@@ -4108,13 +4098,6 @@ impl AgentPanel {
                         .gap_1()
                         .pl_1()
                         .pr_1()
-                        .when(show_history_menu && !has_v2_flag, |this| {
-                            this.child(self.render_recent_entries_menu(
-                                IconName::MenuAltTemp,
-                                Corner::TopRight,
-                                cx,
-                            ))
-                        })
                         .when(is_full_screen, |this| {
                             this.child(
                                 IconButton::new("disable-full-screen", IconName::Minimize)
@@ -4174,13 +4157,6 @@ impl AgentPanel {
                         .pl_1()
                         .pr_1()
                         .child(new_thread_menu)
-                        .when(show_history_menu && !has_v2_flag, |this| {
-                            this.child(self.render_recent_entries_menu(
-                                IconName::MenuAltTemp,
-                                Corner::TopRight,
-                                cx,
-                            ))
-                        })
                         .when(is_full_screen, |this| {
                             this.child(
                                 IconButton::new("disable-full-screen", IconName::Minimize)
@@ -5036,7 +5012,6 @@ mod tests {
     use acp_thread::{StubAgentConnection, ThreadStatus};
     use agent_servers::CODEX_ID;
     use assistant_text_thread::TextThreadStore;
-    use feature_flags::FeatureFlagAppExt;
     use fs::FakeFs;
     use gpui::{TestAppContext, VisualTestContext};
     use project::Project;
@@ -5048,7 +5023,6 @@ mod tests {
     async fn test_active_thread_serialize_and_load_round_trip(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
-            cx.update_flags(true, vec!["agent-v2".to_string()]);
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
         });
@@ -5175,7 +5149,6 @@ mod tests {
         let fs = FakeFs::new(cx.executor());
 
         cx.update(|cx| {
-            cx.update_flags(true, vec!["agent-v2".to_string()]);
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
             let slash_command_registry =
@@ -5532,7 +5505,6 @@ mod tests {
     async fn setup_panel(cx: &mut TestAppContext) -> (Entity<AgentPanel>, VisualTestContext) {
         init_test(cx);
         cx.update(|cx| {
-            cx.update_flags(true, vec!["agent-v2".to_string()]);
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
         });
@@ -5856,7 +5828,6 @@ mod tests {
     async fn test_thread_target_local_project(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
-            cx.update_flags(true, vec!["agent-v2".to_string()]);
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
         });
@@ -5966,7 +5937,6 @@ mod tests {
     async fn test_thread_target_serialization_round_trip(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
-            cx.update_flags(true, vec!["agent-v2".to_string()]);
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
         });
@@ -6059,7 +6029,6 @@ mod tests {
 
         let fs = FakeFs::new(cx.executor());
         cx.update(|cx| {
-            cx.update_flags(true, vec!["agent-v2".to_string()]);
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
             <dyn fs::Fs>::set_global(fs.clone(), cx);
@@ -6157,7 +6126,6 @@ mod tests {
         init_test(cx);
 
         let app_state = cx.update(|cx| {
-            cx.update_flags(true, vec!["agent-v2".to_string()]);
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
 

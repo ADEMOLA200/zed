@@ -477,7 +477,7 @@ async fn test_workspace_lifecycle(cx: &mut TestAppContext) {
     // Remove the second workspace
     multi_workspace.update_in(cx, |mw, window, cx| {
         let workspace = mw.workspaces().nth(1).unwrap().clone();
-        mw.remove(&workspace, window, cx);
+        mw.remove_group(&workspace, window, cx);
     });
     cx.run_until_parked();
 
@@ -5090,7 +5090,7 @@ mod property_test {
             Operation::RemoveWorkspace { index } => {
                 let removed = multi_workspace.update_in(cx, |mw, window, cx| {
                     let workspace = mw.workspaces().nth(index).unwrap().clone();
-                    mw.remove(&workspace, window, cx)
+                    mw.remove_group(&workspace, window, cx)
                 });
                 if removed {
                     state.workspace_paths.remove(index);

@@ -6,7 +6,6 @@ use gpui::{
     actions, deferred, px,
 };
 use project::DisableAiSettings;
-#[cfg(any(test, feature = "test-support"))]
 use project::Project;
 use remote::RemoteConnectionOptions;
 use settings::Settings;
@@ -88,7 +87,7 @@ pub fn sidebar_side_context_menu(
 pub enum MultiWorkspaceEvent {
     ActiveWorkspaceChanged,
     WorkspaceAdded(Entity<Workspace>),
-    WorkspaceRemoved(EntityId),
+    WorkspaceRemoved,
 }
 
 pub enum SidebarEvent {
@@ -270,6 +269,9 @@ pub struct MultiWorkspace {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Represents a group of workspaces with the same project key (main worktree paths and host).
+///
+/// Invariant: a project group always has at least one workspace.
 struct ProjectGroup {
     key: ProjectGroupKey,
     workspaces: Vec<Entity<Workspace>>,
@@ -582,13 +584,12 @@ impl MultiWorkspace {
 
         let old_workspace = std::mem::replace(&mut self.active_workspace, workspace.clone());
 
-        let old_entity_id = old_workspace.entity_id();
         self.detach_workspace(&old_workspace, cx);
 
         Self::subscribe_to_workspace(&workspace, window, cx);
         self.sync_sidebar_to_workspace(&workspace, cx);
 
-        cx.emit(MultiWorkspaceEvent::WorkspaceRemoved(old_entity_id));
+        cx.emit(MultiWorkspaceEvent::WorkspaceRemoved);
         cx.emit(MultiWorkspaceEvent::WorkspaceAdded(workspace));
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
         self.serialize(cx);
@@ -902,43 +903,55 @@ impl MultiWorkspace {
         })
     }
 
-    pub fn remove(
+    /// Removes the group that contains this workspace.
+    pub fn remove_group(
         &mut self,
         workspace: &Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let all_workspaces: Vec<_> = self.workspaces().collect();
-        if all_workspaces.len() <= 1 {
-            return false;
-        }
-
-        let Some(group) = self
+        let Some(group_ix) = self
             .project_groups
             .iter_mut()
-            .find(|g| g.workspaces.contains(workspace))
+            .position(|g| g.workspaces.contains(workspace))
         else {
             return false;
         };
-        group.workspaces.retain(|w| w != workspace);
 
-        // Remove empty groups.
-        self.project_groups.retain(|g| !g.workspaces.is_empty());
+        let removed_group = self.project_groups.remove(group_ix);
 
         // If we removed the active workspace, pick a new one.
-        if self.active_workspace == *workspace {
-            let workspace = self
-                .workspaces()
-                .next()
-                .expect("there is always at least one workspace after the len() > 1 check");
-            self.active_workspace = workspace;
+        let app_state = workspace.read(cx).app_state().clone();
+        if removed_group.workspaces.contains(&self.active_workspace) {
+            let workspace = self.workspaces().next();
+            if let Some(workspace) = workspace {
+                self.active_workspace = workspace;
+            } else {
+                let project = Project::local(
+                    app_state.client.clone(),
+                    app_state.node_runtime.clone(),
+                    app_state.user_store.clone(),
+                    app_state.languages.clone(),
+                    app_state.fs.clone(),
+                    None,
+                    project::LocalProjectFlags::default(),
+                    cx,
+                );
+                let empty_workspace =
+                    cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+                self.project_groups
+                    .push(ProjectGroup::from_workspace(empty_workspace.clone(), cx));
+                self.active_workspace = empty_workspace;
+            }
         }
 
-        self.detach_workspace(workspace, cx);
+        for workspace in removed_group.workspaces {
+            self.detach_workspace(&workspace, cx);
+        }
 
         self.serialize(cx);
         self.focus_active_workspace(window, cx);
-        cx.emit(MultiWorkspaceEvent::WorkspaceRemoved(workspace.entity_id()));
+        cx.emit(MultiWorkspaceEvent::WorkspaceRemoved);
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
         cx.notify();
 
@@ -952,7 +965,7 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) {
         let workspace = workspace.clone();
-        if !self.remove(&workspace, window, cx) {
+        if !self.remove_group(&workspace, window, cx) {
             return;
         }
 

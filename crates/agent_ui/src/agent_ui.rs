@@ -35,9 +35,11 @@ mod thread_history;
 mod thread_history_view;
 mod thread_import;
 pub mod thread_metadata_store;
+mod thread_worktree_picker;
 pub mod threads_archive_view;
 mod ui;
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -286,15 +288,20 @@ impl Agent {
 }
 
 /// Sets where new threads will run.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Action,
-)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Action)]
 #[action(namespace = agent)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum StartThreadIn {
     #[default]
     LocalProject,
-    NewWorktree,
+    NewWorktree {
+        #[serde(default)]
+        branch_name: Option<String>,
+    },
+    LinkedWorktree {
+        path: PathBuf,
+        display_name: String,
+    },
 }
 
 /// Content to initialize new external agent with.

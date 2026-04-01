@@ -710,7 +710,7 @@ impl ThreadMetadataDb {
         self.write(move |conn| {
             let mut stmt = Statement::prepare(
                 conn,
-                "INSERT INTO archived_git_worktrees(\
+                "INSERT OR REPLACE INTO archived_git_worktrees(\
                      worktree_path, main_repo_path, branch_name, commit_hash\
                  ) VALUES (?, ?, ?, ?)",
             )?;

@@ -147,7 +147,6 @@ use workspace::{
 use worktree::CreatedEntry;
 
 enum Operation {
-    Create(ProjectPath),
     Trash(ProjectPath),
     Rename(ProjectPath, ProjectPath),
     Restore(WorktreeId, TrashedEntry),
@@ -157,10 +156,6 @@ enum Operation {
 impl Operation {
     async fn execute(self, undo_manager: &Inner, cx: &mut AsyncApp) -> Result<Change> {
         Ok(match self {
-            Operation::Create(project_path) => {
-                undo_manager.create(&project_path, cx).await?;
-                Change::Created(project_path)
-            }
             Operation::Trash(project_path) => {
                 let trash_entry = undo_manager.trash(&project_path, cx).await?;
                 Change::Trashed(project_path.worktree_id, trash_entry)
@@ -256,7 +251,8 @@ impl UndoManager {
             can_redo: Arc::clone(&inner.can_redo),
         };
 
-        inner.manage_undo_and_redo(cx.to_async());
+        cx.spawn(async move |cx| inner.manage_undo_and_redo(cx.clone()))
+            .detach();
 
         this
     }
@@ -306,12 +302,12 @@ impl Inner {
                 UndoMessage::Changed(changes) => Ok(self.record(changes)),
                 UndoMessage::PlsUndo => {
                     let res = self.undo(&mut cx).await;
-                    self.panel.update(&mut cx, |_, cx| cx.notify());
+                    let _ = self.panel.update(&mut cx, |_, cx| cx.notify());
                     res
                 }
                 UndoMessage::PlsRedo => {
                     let res = self.redo(&mut cx).await;
-                    self.panel.update(&mut cx, |_, cx| cx.notify());
+                    let _ = self.panel.update(&mut cx, |_, cx| cx.notify());
                     res
                 }
             }
@@ -478,27 +474,6 @@ impl Inner {
         res?.await
     }
 
-    async fn create(&self, project_path: &ProjectPath, cx: &mut AsyncApp) -> Result<CreatedEntry> {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return Err(anyhow!("Failed to obtain workspace."));
-        };
-
-        workspace
-            .update(cx, |workspace, cx| {
-                workspace.project().update(cx, |project, cx| {
-                    // This should not be hardcoded to `false`, as it can genuinely
-                    // be a directory and it misses all the nuances and details from
-                    // `ProjectPanel::confirm_edit`. However, we expect this to be a
-                    // short-lived solution as we add support for restoring trashed
-                    // files, at which point we'll no longer need to `Create` new
-                    // files, any redoing of a trash operation should be a restore.
-                    let is_directory = false;
-                    project.create_entry(project_path.clone(), is_directory, cx)
-                })
-            })
-            .await
-    }
-
     async fn trash(&self, project_path: &ProjectPath, cx: &mut AsyncApp) -> Result<TrashedEntry> {
         let Some(workspace) = self.workspace.upgrade() else {
             return Err(anyhow!("Failed to obtain workspace."));
@@ -541,20 +516,6 @@ impl Inner {
             })
             .await
     }
-
-    // async fn {
-    //     // access some data in gpui mutable
-    //     await <- scheduler could go do something else that also accesses that data
-    //     // do something with that data
-    // }
-
-    // fn -> Task {
-    //     access some data muta
-    //     cx.spawn({
-    //         asyncthing.await
-    //         // do something with data
-    //     }
-    // }
 
     /// Displays a notification with the provided `title` and `error`.
     fn show_error(

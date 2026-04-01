@@ -22,7 +22,10 @@ use language_model::LanguageModelToolResultContent;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{AgentLocation, Project, ProjectPath};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, Error as _},
+};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -89,7 +92,11 @@ pub struct StreamingEditFileToolInput {
 
     /// List of edit operations to apply sequentially (required for 'edit' mode).
     /// Each edit finds `old_text` in the file and replaces it with `new_text`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_vec_or_json_string"
+    )]
     pub edits: Option<Vec<Edit>>,
 }
 
@@ -104,12 +111,13 @@ pub enum StreamingEditFileMode {
 }
 
 /// A single edit operation that replaces old text with new text
+/// Properly escape all text fields as valid JSON strings.
+/// Remember to escape special characters like newlines (`\n`) and quotes (`"`) in JSON strings.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Edit {
     /// The exact text to find in the file. This will be matched using fuzzy matching
     /// to handle minor differences in whitespace or formatting.
     ///
-    /// Always include complete lines. Do not start or end mid-line.
     /// Be minimal with replacements:
     /// - For unique lines, include only those lines
     /// - For non-unique lines, include enough context to identify them
@@ -128,7 +136,7 @@ struct StreamingEditFileToolPartialInput {
     mode: Option<StreamingEditFileMode>,
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_vec_or_json_string")]
     edits: Option<Vec<PartialEdit>>,
 }
 
@@ -138,6 +146,33 @@ pub struct PartialEdit {
     pub old_text: Option<String>,
     #[serde(default)]
     pub new_text: Option<String>,
+}
+
+/// Sometimes the model responds with a stringified JSON array of edits (`"[...]"`) instead of a regular array (`[...]`)
+fn deserialize_optional_vec_or_json_string<'de, T, D>(
+    deserializer: D,
+) -> Result<Option<Vec<T>>, D::Error>
+where
+    T: DeserializeOwned,
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum VecOrJsonString<T> {
+        Vec(Vec<T>),
+        String(String),
+    }
+
+    let value = Option::<VecOrJsonString<T>>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(VecOrJsonString::Vec(items)) => Ok(Some(items)),
+        Some(VecOrJsonString::String(string)) => serde_json::from_str::<Vec<T>>(&string)
+            .map(Some)
+            .map_err(|error| {
+                D::Error::custom(format!("failed to parse stringified edits array: {error}"))
+            }),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -592,11 +627,7 @@ impl EditSession {
         }
 
         let format_on_save_enabled = self.buffer.read_with(cx, |buffer, cx| {
-            let settings = language_settings::language_settings(
-                buffer.language().map(|l| l.name()),
-                buffer.file(),
-                cx,
-            );
+            let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
             settings.format_on_save != FormatOnSave::Off
         });
 
@@ -2462,7 +2493,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(stream_rx.try_next().is_err());
+        assert!(stream_rx.try_recv().is_err());
 
         // Test 4: Path with .zed in the middle should require confirmation
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
@@ -2509,7 +2540,7 @@ mod tests {
         cx.update(|cx| tool.authorize(&PathBuf::from("/etc/hosts"), "test 5.2", &stream_tx, cx))
             .await
             .unwrap();
-        assert!(stream_rx.try_next().is_err());
+        assert!(stream_rx.try_recv().is_err());
 
         // 5.3: Normal in-project path with allow — no confirmation needed
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
@@ -2523,7 +2554,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(stream_rx.try_next().is_err());
+        assert!(stream_rx.try_recv().is_err());
 
         // 5.4: With Confirm default, non-project paths still prompt
         cx.update(|cx| {
@@ -2581,7 +2612,10 @@ mod tests {
 
         event
             .response
-            .send(acp::PermissionOptionId::new("allow"))
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
             .unwrap();
         authorize_task.await.unwrap();
     }
@@ -2733,8 +2767,8 @@ mod tests {
         assert!(result.is_err(), "Tool should fail when policy denies");
         assert!(
             !matches!(
-                stream_rx.try_next(),
-                Ok(Some(Ok(crate::ThreadEvent::ToolCallAuthorization(_))))
+                stream_rx.try_recv(),
+                Ok(Ok(crate::ThreadEvent::ToolCallAuthorization(_)))
             ),
             "Deny policy should not emit symlink authorization prompt",
         );
@@ -2776,7 +2810,7 @@ mod tests {
             } else {
                 auth.await.unwrap();
                 assert!(
-                    stream_rx.try_next().is_err(),
+                    stream_rx.try_recv().is_err(),
                     "Failed for case: {} - path: {} - expected no confirmation but got one",
                     description,
                     path
@@ -2853,7 +2887,7 @@ mod tests {
             } else {
                 auth.await.unwrap();
                 assert!(
-                    stream_rx.try_next().is_err(),
+                    stream_rx.try_recv().is_err(),
                     "Failed for case: {} - path: {} - expected no confirmation but got one",
                     description,
                     path
@@ -2913,7 +2947,7 @@ mod tests {
                 stream_rx.expect_authorization().await;
             } else {
                 assert!(
-                    stream_rx.try_next().is_err(),
+                    stream_rx.try_recv().is_err(),
                     "Failed for case: {} - path: {} - expected no confirmation but got one",
                     description,
                     path
@@ -2981,7 +3015,7 @@ mod tests {
             })
             .await
             .unwrap();
-            assert!(stream_rx.try_next().is_err());
+            assert!(stream_rx.try_recv().is_err());
         }
     }
 
@@ -3670,6 +3704,35 @@ mod tests {
         assert_eq!(new_text, "HELLO\nWORLD\nfoo\n");
     }
 
+    #[gpui::test]
+    async fn test_streaming_final_input_stringified_edits_succeeds(cx: &mut TestAppContext) {
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.txt": "hello\nworld\n"})).await;
+        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
+
+        sender.send_partial(json!({
+            "display_description": "Edit",
+            "path": "root/file.txt",
+            "mode": "edit"
+        }));
+        cx.run_until_parked();
+
+        sender.send_final(json!({
+            "display_description": "Edit",
+            "path": "root/file.txt",
+            "mode": "edit",
+            "edits": "[{\"old_text\": \"hello\\nworld\", \"new_text\": \"HELLO\\nWORLD\"}]"
+        }));
+
+        let result = task.await;
+        let StreamingEditFileToolOutput::Success { new_text, .. } = result.unwrap() else {
+            panic!("expected success");
+        };
+        assert_eq!(new_text, "HELLO\nWORLD\n");
+    }
+
     // Verifies that after streaming_edit_file_tool edits a file, the action log
     // reports changed buffers so that the Accept All / Reject All review UI appears.
     #[gpui::test]
@@ -3852,6 +3915,97 @@ mod tests {
             panic!("expected success");
         };
         assert_eq!(new_text, "new_content");
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_partial_last_line(cx: &mut TestAppContext) {
+        let file_content = indoc::indoc! {r#"
+            fn on_query_change(&mut self, cx: &mut Context<Self>) {
+                self.filter(cx);
+            }
+
+
+
+            fn render_search(&self, cx: &mut Context<Self>) -> Div {
+                div()
+            }
+        "#}
+        .to_string();
+
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.rs": file_content})).await;
+
+        // The model sends old_text with a PARTIAL last line.
+        let old_text = "}\n\n\n\nfn render_search";
+        let new_text = "}\n\nfn render_search";
+
+        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
+
+        sender.send_final(json!({
+            "display_description": "Remove extra blank lines",
+            "path": "root/file.rs",
+            "mode": "edit",
+            "edits": [{"old_text": old_text, "new_text": new_text}]
+        }));
+
+        let result = task.await;
+        let StreamingEditFileToolOutput::Success {
+            new_text: final_text,
+            ..
+        } = result.unwrap()
+        else {
+            panic!("expected success");
+        };
+
+        // The edit should reduce 3 blank lines to 1 blank line before
+        // fn render_search, without duplicating the function signature.
+        let expected = file_content.replace("}\n\n\n\nfn render_search", "}\n\nfn render_search");
+        pretty_assertions::assert_eq!(
+            final_text,
+            expected,
+            "Edit should only remove blank lines before render_search"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_streaming_edit_preserves_blank_line_after_trailing_newline_replacement(
+        cx: &mut TestAppContext,
+    ) {
+        let file_content = "before\ntarget\n\nafter\n";
+        let old_text = "target\n";
+        let new_text = "one\ntwo\ntarget\n";
+        let expected = "before\none\ntwo\ntarget\n\nafter\n";
+
+        let (tool, _project, _action_log, _fs, _thread) =
+            setup_test(cx, json!({"file.rs": file_content})).await;
+        let (sender, input) = ToolInput::<StreamingEditFileToolInput>::test();
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| tool.clone().run(input, event_stream, cx));
+
+        sender.send_final(json!({
+            "display_description": "description",
+            "path": "root/file.rs",
+            "mode": "edit",
+            "edits": [{"old_text": old_text, "new_text": new_text}]
+        }));
+
+        let result = task.await;
+
+        let StreamingEditFileToolOutput::Success {
+            new_text: final_text,
+            ..
+        } = result.unwrap()
+        else {
+            panic!("expected success");
+        };
+
+        pretty_assertions::assert_eq!(
+            final_text,
+            expected,
+            "Edit should preserve a single blank line before test_after"
+        );
     }
 
     #[gpui::test]

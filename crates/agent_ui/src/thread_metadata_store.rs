@@ -1,11 +1,11 @@
 use std::{path::Path, sync::Arc};
 
-use acp_thread::AgentSessionInfo;
+use acp_thread::AcpThreadEvent;
 use agent::{ThreadStore, ZED_AGENT_ID};
 use agent_client_protocol as acp;
-use anyhow::{Context as _, Result};
+use anyhow::Context as _;
 use chrono::{DateTime, Utc};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use db::{
     sqlez::{
         bindable::Column, domain::Domain, statement::Statement,
@@ -21,8 +21,10 @@ use ui::{App, Context, SharedString};
 use util::ResultExt as _;
 use workspace::PathList;
 
+use crate::DEFAULT_THREAD_TITLE;
+
 pub fn init(cx: &mut App) {
-    SidebarThreadMetadataStore::init_global(cx);
+    ThreadMetadataStore::init_global(cx);
 
     if cx.has_flag::<AgentV2FeatureFlag>() {
         migrate_thread_metadata(cx);
@@ -36,129 +38,139 @@ pub fn init(cx: &mut App) {
 }
 
 /// Migrate existing thread metadata from native agent thread store to the new metadata storage.
+/// We skip migrating threads that do not have a project.
 ///
 /// TODO: Remove this after N weeks of shipping the sidebar
 fn migrate_thread_metadata(cx: &mut App) {
-    let store = SidebarThreadMetadataStore::global(cx);
+    let store = ThreadMetadataStore::global(cx);
     let db = store.read(cx).db.clone();
 
     cx.spawn(async move |cx| {
-        if !db.is_empty()? {
-            return Ok::<(), anyhow::Error>(());
-        }
+        let existing_entries = db.list_ids()?.into_iter().collect::<HashSet<_>>();
 
-        let metadata = store.read_with(cx, |_store, app| {
-            ThreadStore::global(app)
-                .read(app)
+        let is_first_migration = existing_entries.is_empty();
+
+        let mut to_migrate = store.read_with(cx, |_store, cx| {
+            ThreadStore::global(cx)
+                .read(cx)
                 .entries()
-                .map(|entry| ThreadMetadata {
-                    session_id: entry.id,
-                    agent_id: None,
-                    title: entry.title,
-                    updated_at: entry.updated_at,
-                    created_at: entry.created_at,
-                    folder_paths: entry.folder_paths,
+                .filter_map(|entry| {
+                    if existing_entries.contains(&entry.id.0) {
+                        return None;
+                    }
+
+                    Some(ThreadMetadata {
+                        session_id: entry.id,
+                        agent_id: ZED_AGENT_ID.clone(),
+                        title: entry.title,
+                        updated_at: entry.updated_at,
+                        created_at: entry.created_at,
+                        folder_paths: entry.folder_paths,
+                        archived: true,
+                    })
                 })
                 .collect::<Vec<_>>()
         });
 
+        if to_migrate.is_empty() {
+            return anyhow::Ok(());
+        }
+
+        // On the first migration (no entries in DB yet), keep the 5 most
+        // recent threads per project unarchived.
+        if is_first_migration {
+            let mut per_project: HashMap<PathList, Vec<&mut ThreadMetadata>> = HashMap::default();
+            for entry in &mut to_migrate {
+                if entry.folder_paths.is_empty() {
+                    continue;
+                }
+                per_project
+                    .entry(entry.folder_paths.clone())
+                    .or_default()
+                    .push(entry);
+            }
+            for entries in per_project.values_mut() {
+                entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                for entry in entries.iter_mut().take(5) {
+                    entry.archived = false;
+                }
+            }
+        }
+
+        log::info!("Migrating {} thread store entries", to_migrate.len());
+
         // Manually save each entry to the database and call reload, otherwise
         // we'll end up triggering lots of reloads after each save
-        for entry in metadata {
+        for entry in to_migrate {
             db.save(entry).await?;
         }
 
+        log::info!("Finished migrating thread store entries");
+
         let _ = store.update(cx, |store, cx| store.reload(cx));
-        Ok(())
+        anyhow::Ok(())
     })
     .detach_and_log_err(cx);
 }
 
-struct GlobalThreadMetadataStore(Entity<SidebarThreadMetadataStore>);
+struct GlobalThreadMetadataStore(Entity<ThreadMetadataStore>);
 impl Global for GlobalThreadMetadataStore {}
 
 /// Lightweight metadata for any thread (native or ACP), enough to populate
 /// the sidebar list and route to the correct load path when clicked.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ThreadMetadata {
     pub session_id: acp::SessionId,
-    /// `None` for native Zed threads, `Some("claude-code")` etc. for ACP agents.
-    pub agent_id: Option<AgentId>,
+    pub agent_id: AgentId,
     pub title: SharedString,
     pub updated_at: DateTime<Utc>,
     pub created_at: Option<DateTime<Utc>>,
     pub folder_paths: PathList,
+    pub archived: bool,
 }
 
-impl ThreadMetadata {
-    pub fn from_session_info(agent_id: AgentId, session: &AgentSessionInfo) -> Self {
-        let session_id = session.session_id.clone();
-        let title = session.title.clone().unwrap_or_default();
-        let updated_at = session.updated_at.unwrap_or_else(|| Utc::now());
-        let created_at = session.created_at.unwrap_or(updated_at);
-        let folder_paths = session.work_dirs.clone().unwrap_or_default();
-        let agent_id = if agent_id.as_ref() == ZED_AGENT_ID.as_ref() {
-            None
-        } else {
-            Some(agent_id)
-        };
+impl From<&ThreadMetadata> for acp_thread::AgentSessionInfo {
+    fn from(meta: &ThreadMetadata) -> Self {
         Self {
-            session_id,
-            agent_id,
-            title,
-            updated_at,
-            created_at: Some(created_at),
-            folder_paths,
-        }
-    }
-
-    pub fn from_thread(thread: &Entity<acp_thread::AcpThread>, cx: &App) -> Self {
-        let thread_ref = thread.read(cx);
-        let session_id = thread_ref.session_id().clone();
-        let title = thread_ref.title();
-        let updated_at = Utc::now();
-
-        let agent_id = thread_ref.connection().agent_id();
-
-        let agent_id = if agent_id.as_ref() == ZED_AGENT_ID.as_ref() {
-            None
-        } else {
-            Some(agent_id)
-        };
-
-        let folder_paths = {
-            let project = thread_ref.project().read(cx);
-            let paths: Vec<Arc<Path>> = project
-                .visible_worktrees(cx)
-                .map(|worktree| worktree.read(cx).abs_path())
-                .collect();
-            PathList::new(&paths)
-        };
-
-        Self {
-            session_id,
-            agent_id,
-            title,
-            created_at: Some(updated_at), // handled by db `ON CONFLICT`
-            updated_at,
-            folder_paths,
+            session_id: meta.session_id.clone(),
+            work_dirs: Some(meta.folder_paths.clone()),
+            title: Some(meta.title.clone()),
+            updated_at: Some(meta.updated_at),
+            created_at: meta.created_at,
+            meta: None,
         }
     }
 }
 
-/// The store holds all metadata needed to show threads in the sidebar.
-/// Effectively, all threads stored in here are "non-archived".
+/// The store holds all metadata needed to show threads in the sidebar/the archive.
 ///
 /// Automatically listens to AcpThread events and updates metadata if it has changed.
-pub struct SidebarThreadMetadataStore {
+pub struct ThreadMetadataStore {
     db: ThreadMetadataDb,
-    threads: Vec<ThreadMetadata>,
-    threads_by_paths: HashMap<PathList, Vec<ThreadMetadata>>,
+    threads: HashMap<acp::SessionId, ThreadMetadata>,
+    threads_by_paths: HashMap<PathList, HashSet<acp::SessionId>>,
     reload_task: Option<Shared<Task<()>>>,
     session_subscriptions: HashMap<acp::SessionId, Subscription>,
+    pending_thread_ops_tx: smol::channel::Sender<DbOperation>,
+    _db_operations_task: Task<()>,
 }
 
-impl SidebarThreadMetadataStore {
+#[derive(Debug, PartialEq)]
+enum DbOperation {
+    Upsert(ThreadMetadata),
+    Delete(acp::SessionId),
+}
+
+impl DbOperation {
+    fn id(&self) -> &acp::SessionId {
+        match self {
+            DbOperation::Upsert(thread) => &thread.session_id,
+            DbOperation::Delete(session_id) => session_id,
+        }
+    }
+}
+
+impl ThreadMetadataStore {
     #[cfg(not(any(test, feature = "test-support")))]
     pub fn init_global(cx: &mut App) {
         if cx.has_global::<Self>() {
@@ -193,23 +205,37 @@ impl SidebarThreadMetadataStore {
         self.threads.is_empty()
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = ThreadMetadata> + '_ {
-        self.threads.iter().cloned()
-    }
-
+    /// Returns all thread IDs.
     pub fn entry_ids(&self) -> impl Iterator<Item = acp::SessionId> + '_ {
-        self.threads.iter().map(|thread| thread.session_id.clone())
+        self.threads.keys().cloned()
     }
 
+    /// Returns the metadata for a specific thread, if it exists.
+    pub fn entry(&self, session_id: &acp::SessionId) -> Option<&ThreadMetadata> {
+        self.threads.get(session_id)
+    }
+
+    /// Returns all threads.
+    pub fn entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
+        self.threads.values()
+    }
+
+    /// Returns all archived threads.
+    pub fn archived_entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
+        self.entries().filter(|t| t.archived)
+    }
+
+    /// Returns all threads for the given path list, excluding archived threads.
     pub fn entries_for_path(
         &self,
         path_list: &PathList,
-    ) -> impl Iterator<Item = ThreadMetadata> + '_ {
+    ) -> impl Iterator<Item = &ThreadMetadata> + '_ {
         self.threads_by_paths
             .get(path_list)
             .into_iter()
             .flatten()
-            .cloned()
+            .filter_map(|s| self.threads.get(s))
+            .filter(|s| !s.archived)
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
@@ -233,8 +259,8 @@ impl SidebarThreadMetadataStore {
                         this.threads_by_paths
                             .entry(row.folder_paths.clone())
                             .or_default()
-                            .push(row.clone());
-                        this.threads.push(row);
+                            .insert(row.session_id.clone());
+                        this.threads.insert(row.session_id.clone(), row);
                     }
 
                     cx.notify();
@@ -246,36 +272,114 @@ impl SidebarThreadMetadataStore {
         reload_task
     }
 
-    pub fn save(&mut self, metadata: ThreadMetadata, cx: &mut Context<Self>) -> Task<Result<()>> {
+    pub fn save_all(&mut self, metadata: Vec<ThreadMetadata>, cx: &mut Context<Self>) {
         if !cx.has_flag::<AgentV2FeatureFlag>() {
-            return Task::ready(Ok(()));
+            return;
         }
 
-        let db = self.db.clone();
-        cx.spawn(async move |this, cx| {
-            db.save(metadata).await?;
-            let reload_task = this.update(cx, |this, cx| this.reload(cx))?;
-            reload_task.await;
-            Ok(())
-        })
+        for metadata in metadata {
+            self.save_internal(metadata);
+        }
+        cx.notify();
     }
 
-    pub fn delete(
-        &mut self,
-        session_id: acp::SessionId,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn save_manually(&mut self, metadata: ThreadMetadata, cx: &mut Context<Self>) {
+        self.save(metadata, cx)
+    }
+
+    fn save(&mut self, metadata: ThreadMetadata, cx: &mut Context<Self>) {
         if !cx.has_flag::<AgentV2FeatureFlag>() {
-            return Task::ready(Ok(()));
+            return;
         }
 
-        let db = self.db.clone();
-        cx.spawn(async move |this, cx| {
-            db.delete(session_id).await?;
-            let reload_task = this.update(cx, |this, cx| this.reload(cx))?;
-            reload_task.await;
-            Ok(())
-        })
+        self.save_internal(metadata);
+        cx.notify();
+    }
+
+    fn save_internal(&mut self, metadata: ThreadMetadata) {
+        // If the folder paths have changed, we need to clear the old entry
+        if let Some(thread) = self.threads.get(&metadata.session_id)
+            && thread.folder_paths != metadata.folder_paths
+            && let Some(session_ids) = self.threads_by_paths.get_mut(&thread.folder_paths)
+        {
+            session_ids.remove(&metadata.session_id);
+        }
+
+        self.threads
+            .insert(metadata.session_id.clone(), metadata.clone());
+
+        self.threads_by_paths
+            .entry(metadata.folder_paths.clone())
+            .or_default()
+            .insert(metadata.session_id.clone());
+
+        self.pending_thread_ops_tx
+            .try_send(DbOperation::Upsert(metadata))
+            .log_err();
+    }
+
+    pub fn update_working_directories(
+        &mut self,
+        session_id: &acp::SessionId,
+        work_dirs: PathList,
+        cx: &mut Context<Self>,
+    ) {
+        if !cx.has_flag::<AgentV2FeatureFlag>() {
+            return;
+        }
+
+        if let Some(thread) = self.threads.get(session_id) {
+            self.save_internal(ThreadMetadata {
+                folder_paths: work_dirs,
+                ..thread.clone()
+            });
+            cx.notify();
+        }
+    }
+
+    pub fn archive(&mut self, session_id: &acp::SessionId, cx: &mut Context<Self>) {
+        self.update_archived(session_id, true, cx);
+    }
+
+    pub fn unarchive(&mut self, session_id: &acp::SessionId, cx: &mut Context<Self>) {
+        self.update_archived(session_id, false, cx);
+    }
+
+    fn update_archived(
+        &mut self,
+        session_id: &acp::SessionId,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !cx.has_flag::<AgentV2FeatureFlag>() {
+            return;
+        }
+
+        if let Some(thread) = self.threads.get(session_id) {
+            self.save_internal(ThreadMetadata {
+                archived,
+                ..thread.clone()
+            });
+            cx.notify();
+        }
+    }
+
+    pub fn delete(&mut self, session_id: acp::SessionId, cx: &mut Context<Self>) {
+        if !cx.has_flag::<AgentV2FeatureFlag>() {
+            return;
+        }
+
+        if let Some(thread) = self.threads.get(&session_id)
+            && let Some(session_ids) = self.threads_by_paths.get_mut(&thread.folder_paths)
+        {
+            session_ids.remove(&session_id);
+        }
+        self.threads.remove(&session_id);
+        self.pending_thread_ops_tx
+            .try_send(DbOperation::Delete(session_id))
+            .log_err();
+        cx.notify();
     }
 
     fn new(db: ThreadMetadataDb, cx: &mut Context<Self>) -> Self {
@@ -293,8 +397,14 @@ impl SidebarThreadMetadataStore {
                 let weak_store = weak_store.clone();
                 move |thread, cx| {
                     weak_store
-                        .update(cx, |store, _cx| {
-                            store.session_subscriptions.remove(thread.session_id());
+                        .update(cx, |store, cx| {
+                            let session_id = thread.session_id().clone();
+                            store.session_subscriptions.remove(&session_id);
+                            if thread.entries().is_empty() {
+                                // Empty threads can be unloaded without ever being
+                                // durably persisted by the underlying agent.
+                                store.delete(session_id, cx);
+                            }
                         })
                         .ok();
                 }
@@ -303,7 +413,7 @@ impl SidebarThreadMetadataStore {
 
             weak_store
                 .update(cx, |this, cx| {
-                    let subscription = cx.subscribe(&thread_entity, Self::handle_thread_update);
+                    let subscription = cx.subscribe(&thread_entity, Self::handle_thread_event);
                     this.session_subscriptions
                         .insert(thread.session_id().clone(), subscription);
                 })
@@ -311,21 +421,58 @@ impl SidebarThreadMetadataStore {
         })
         .detach();
 
+        let (tx, rx) = smol::channel::unbounded();
+        let _db_operations_task = cx.background_spawn({
+            let db = db.clone();
+            async move {
+                while let Ok(first_update) = rx.recv().await {
+                    let mut updates = vec![first_update];
+                    while let Ok(update) = rx.try_recv() {
+                        updates.push(update);
+                    }
+                    let updates = Self::dedup_db_operations(updates);
+                    for operation in updates {
+                        match operation {
+                            DbOperation::Upsert(metadata) => {
+                                db.save(metadata).await.log_err();
+                            }
+                            DbOperation::Delete(session_id) => {
+                                db.delete(session_id).await.log_err();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         let mut this = Self {
             db,
-            threads: Vec::new(),
+            threads: HashMap::default(),
             threads_by_paths: HashMap::default(),
             reload_task: None,
             session_subscriptions: HashMap::default(),
+            pending_thread_ops_tx: tx,
+            _db_operations_task,
         };
         let _ = this.reload(cx);
         this
     }
 
-    fn handle_thread_update(
+    fn dedup_db_operations(operations: Vec<DbOperation>) -> Vec<DbOperation> {
+        let mut ops = HashMap::default();
+        for operation in operations.into_iter().rev() {
+            if ops.contains_key(operation.id()) {
+                continue;
+            }
+            ops.insert(operation.id().clone(), operation);
+        }
+        ops.into_values().collect()
+    }
+
+    fn handle_thread_event(
         &mut self,
         thread: Entity<acp_thread::AcpThread>,
-        event: &acp_thread::AcpThreadEvent,
+        event: &AcpThreadEvent,
         cx: &mut Context<Self>,
     ) {
         // Don't track subagent threads in the sidebar.
@@ -334,57 +481,109 @@ impl SidebarThreadMetadataStore {
         }
 
         match event {
-            acp_thread::AcpThreadEvent::NewEntry
-            | acp_thread::AcpThreadEvent::TitleUpdated
-            | acp_thread::AcpThreadEvent::EntryUpdated(_)
-            | acp_thread::AcpThreadEvent::EntriesRemoved(_)
-            | acp_thread::AcpThreadEvent::ToolAuthorizationRequested(_)
-            | acp_thread::AcpThreadEvent::ToolAuthorizationReceived(_)
-            | acp_thread::AcpThreadEvent::Retry(_)
-            | acp_thread::AcpThreadEvent::Stopped(_)
-            | acp_thread::AcpThreadEvent::Error
-            | acp_thread::AcpThreadEvent::LoadError(_)
-            | acp_thread::AcpThreadEvent::Refusal => {
-                let metadata = ThreadMetadata::from_thread(&thread, cx);
-                self.save(metadata, cx).detach_and_log_err(cx);
+            AcpThreadEvent::NewEntry
+            | AcpThreadEvent::TitleUpdated
+            | AcpThreadEvent::EntryUpdated(_)
+            | AcpThreadEvent::EntriesRemoved(_)
+            | AcpThreadEvent::ToolAuthorizationRequested(_)
+            | AcpThreadEvent::ToolAuthorizationReceived(_)
+            | AcpThreadEvent::Retry(_)
+            | AcpThreadEvent::Stopped(_)
+            | AcpThreadEvent::Error
+            | AcpThreadEvent::LoadError(_)
+            | AcpThreadEvent::Refusal
+            | AcpThreadEvent::WorkingDirectoriesUpdated => {
+                let thread_ref = thread.read(cx);
+                let existing_thread = self.threads.get(thread_ref.session_id());
+                let session_id = thread_ref.session_id().clone();
+                let title = thread_ref
+                    .title()
+                    .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into());
+
+                let updated_at = Utc::now();
+
+                let created_at = existing_thread
+                    .and_then(|t| t.created_at)
+                    .unwrap_or_else(|| updated_at);
+
+                let agent_id = thread_ref.connection().agent_id();
+
+                let folder_paths = {
+                    let project = thread_ref.project().read(cx);
+                    let paths: Vec<Arc<Path>> = project
+                        .visible_worktrees(cx)
+                        .map(|worktree| worktree.read(cx).abs_path())
+                        .collect();
+                    PathList::new(&paths)
+                };
+
+                // Threads without a folder path (e.g. started in an empty
+                // window) are archived by default so they don't get lost,
+                // because they won't show up in the sidebar. Users can reload
+                // them from the archive.
+                let archived = existing_thread
+                    .map(|t| t.archived)
+                    .unwrap_or(folder_paths.is_empty());
+
+                let metadata = ThreadMetadata {
+                    session_id,
+                    agent_id,
+                    title,
+                    created_at: Some(created_at),
+                    updated_at,
+                    folder_paths,
+                    archived,
+                };
+
+                self.save(metadata, cx);
             }
-            _ => {}
+            AcpThreadEvent::TokenUsageUpdated
+            | AcpThreadEvent::SubagentSpawned(_)
+            | AcpThreadEvent::PromptCapabilitiesUpdated
+            | AcpThreadEvent::AvailableCommandsUpdated(_)
+            | AcpThreadEvent::ModeUpdated(_)
+            | AcpThreadEvent::ConfigOptionsUpdated(_) => {}
         }
     }
 }
 
-impl Global for SidebarThreadMetadataStore {}
+impl Global for ThreadMetadataStore {}
 
 struct ThreadMetadataDb(ThreadSafeConnection);
 
 impl Domain for ThreadMetadataDb {
     const NAME: &str = stringify!(ThreadMetadataDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS sidebar_threads(
-            session_id TEXT PRIMARY KEY,
-            agent_id TEXT,
-            title TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            created_at TEXT,
-            folder_paths TEXT,
-            folder_paths_order TEXT
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS sidebar_threads(
+                session_id TEXT PRIMARY KEY,
+                agent_id TEXT,
+                title TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                created_at TEXT,
+                folder_paths TEXT,
+                folder_paths_order TEXT
+            ) STRICT;
+        ),
+        sql!(ALTER TABLE sidebar_threads ADD COLUMN archived INTEGER DEFAULT 0),
+    ];
 }
 
 db::static_connection!(ThreadMetadataDb, []);
 
 impl ThreadMetadataDb {
-    pub fn is_empty(&self) -> anyhow::Result<bool> {
-        self.select::<i64>("SELECT COUNT(*) FROM sidebar_threads")?()
-            .map(|counts| counts.into_iter().next().unwrap_or_default() == 0)
+    pub fn list_ids(&self) -> anyhow::Result<Vec<Arc<str>>> {
+        self.select::<Arc<str>>(
+            "SELECT session_id FROM sidebar_threads \
+             ORDER BY updated_at DESC",
+        )?()
     }
 
     /// List all sidebar thread metadata, ordered by updated_at descending.
     pub fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
         self.select::<ThreadMetadata>(
-            "SELECT session_id, agent_id, title, updated_at, created_at, folder_paths, folder_paths_order \
+            "SELECT session_id, agent_id, title, updated_at, created_at, folder_paths, folder_paths_order, archived \
              FROM sidebar_threads \
              ORDER BY updated_at DESC"
         )?()
@@ -393,7 +592,11 @@ impl ThreadMetadataDb {
     /// Upsert metadata for a thread.
     pub async fn save(&self, row: ThreadMetadata) -> anyhow::Result<()> {
         let id = row.session_id.0.clone();
-        let agent_id = row.agent_id.as_ref().map(|id| id.0.to_string());
+        let agent_id = if row.agent_id.as_ref() == ZED_AGENT_ID.as_ref() {
+            None
+        } else {
+            Some(row.agent_id.to_string())
+        };
         let title = row.title.to_string();
         let updated_at = row.updated_at.to_rfc3339();
         let created_at = row.created_at.map(|dt| dt.to_rfc3339());
@@ -403,16 +606,19 @@ impl ThreadMetadataDb {
         } else {
             (Some(serialized.paths), Some(serialized.order))
         };
+        let archived = row.archived;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(session_id, agent_id, title, updated_at, created_at, folder_paths, folder_paths_order) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+            let sql = "INSERT INTO sidebar_threads(session_id, agent_id, title, updated_at, created_at, folder_paths, folder_paths_order, archived) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                        ON CONFLICT(session_id) DO UPDATE SET \
                            agent_id = excluded.agent_id, \
                            title = excluded.title, \
                            updated_at = excluded.updated_at, \
+                           created_at = excluded.created_at, \
                            folder_paths = excluded.folder_paths, \
-                           folder_paths_order = excluded.folder_paths_order";
+                           folder_paths_order = excluded.folder_paths_order, \
+                           archived = excluded.archived";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&id, 1)?;
             i = stmt.bind(&agent_id, i)?;
@@ -420,7 +626,8 @@ impl ThreadMetadataDb {
             i = stmt.bind(&updated_at, i)?;
             i = stmt.bind(&created_at, i)?;
             i = stmt.bind(&folder_paths, i)?;
-            stmt.bind(&folder_paths_order, i)?;
+            i = stmt.bind(&folder_paths_order, i)?;
+            stmt.bind(&archived, i)?;
             stmt.exec()
         })
         .await
@@ -449,6 +656,11 @@ impl Column for ThreadMetadata {
         let (folder_paths_str, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (folder_paths_order_str, next): (Option<String>, i32) =
             Column::column(statement, next)?;
+        let (archived, next): (bool, i32) = Column::column(statement, next)?;
+
+        let agent_id = agent_id
+            .map(|id| AgentId::new(id))
+            .unwrap_or(ZED_AGENT_ID.clone());
 
         let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)?.with_timezone(&Utc);
         let created_at = created_at_str
@@ -469,11 +681,12 @@ impl Column for ThreadMetadata {
         Ok((
             ThreadMetadata {
                 session_id: acp::SessionId::new(id),
-                agent_id: agent_id.map(|id| AgentId::new(id)),
+                agent_id,
                 title: title.into(),
                 updated_at,
                 created_at,
                 folder_paths,
+                archived,
             },
             next,
         ))
@@ -522,13 +735,25 @@ mod tests {
         folder_paths: PathList,
     ) -> ThreadMetadata {
         ThreadMetadata {
+            archived: false,
             session_id: acp::SessionId::new(session_id),
-            agent_id: None,
+            agent_id: agent::ZED_AGENT_ID.clone(),
             title: title.to_string().into(),
             updated_at,
             created_at: Some(updated_at),
             folder_paths,
         }
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            ThreadMetadataStore::init_global(cx);
+            ThreadStore::init_global(cx);
+        });
+        cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -566,20 +791,22 @@ mod tests {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
             cx.update_flags(true, vec!["agent-v2".to_string()]);
-            SidebarThreadMetadataStore::init_global(cx);
+            ThreadMetadataStore::init_global(cx);
         });
 
         cx.run_until_parked();
 
         cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
+            let store = ThreadMetadataStore::global(cx);
             let store = store.read(cx);
 
             let entry_ids = store
                 .entry_ids()
                 .map(|session_id| session_id.0.to_string())
                 .collect::<Vec<_>>();
-            assert_eq!(entry_ids, vec!["session-1", "session-2"]);
+            assert_eq!(entry_ids.len(), 2);
+            assert!(entry_ids.contains(&"session-1".to_string()));
+            assert!(entry_ids.contains(&"session-2".to_string()));
 
             let first_path_entries = store
                 .entries_for_path(&first_paths)
@@ -597,12 +824,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_store_cache_updates_after_save_and_delete(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            cx.update_flags(true, vec!["agent-v2".to_string()]);
-            SidebarThreadMetadataStore::init_global(cx);
-        });
+        init_test(cx);
 
         let first_paths = PathList::new(&[Path::new("/project-a")]);
         let second_paths = PathList::new(&[Path::new("/project-b")]);
@@ -624,17 +846,17 @@ mod tests {
         );
 
         cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
+            let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
-                store.save(initial_metadata, cx).detach();
-                store.save(second_metadata, cx).detach();
+                store.save(initial_metadata, cx);
+                store.save(second_metadata, cx);
             });
         });
 
         cx.run_until_parked();
 
         cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
+            let store = ThreadMetadataStore::global(cx);
             let store = store.read(cx);
 
             let first_path_entries = store
@@ -658,23 +880,25 @@ mod tests {
         );
 
         cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
+            let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
-                store.save(moved_metadata, cx).detach();
+                store.save(moved_metadata, cx);
             });
         });
 
         cx.run_until_parked();
 
         cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
+            let store = ThreadMetadataStore::global(cx);
             let store = store.read(cx);
 
             let entry_ids = store
                 .entry_ids()
                 .map(|session_id| session_id.0.to_string())
                 .collect::<Vec<_>>();
-            assert_eq!(entry_ids, vec!["session-1", "session-2"]);
+            assert_eq!(entry_ids.len(), 2);
+            assert!(entry_ids.contains(&"session-1".to_string()));
+            assert!(entry_ids.contains(&"session-2".to_string()));
 
             let first_path_entries = store
                 .entries_for_path(&first_paths)
@@ -686,20 +910,22 @@ mod tests {
                 .entries_for_path(&second_paths)
                 .map(|entry| entry.session_id.0.to_string())
                 .collect::<Vec<_>>();
-            assert_eq!(second_path_entries, vec!["session-1", "session-2"]);
+            assert_eq!(second_path_entries.len(), 2);
+            assert!(second_path_entries.contains(&"session-1".to_string()));
+            assert!(second_path_entries.contains(&"session-2".to_string()));
         });
 
         cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
+            let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
-                store.delete(acp::SessionId::new("session-2"), cx).detach();
+                store.delete(acp::SessionId::new("session-2"), cx);
             });
         });
 
         cx.run_until_parked();
 
         cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
+            let store = ThreadMetadataStore::global(cx);
             let store = store.read(cx);
 
             let entry_ids = store
@@ -717,113 +943,150 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_migrate_thread_metadata(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            ThreadStore::init_global(cx);
-            SidebarThreadMetadataStore::init_global(cx);
-        });
+    async fn test_migrate_thread_metadata_migrates_only_missing_threads(cx: &mut TestAppContext) {
+        init_test(cx);
 
-        // Verify the cache is empty before migration
-        let list = cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
-            store.read(cx).entries().collect::<Vec<_>>()
-        });
-        assert_eq!(list.len(), 0);
-
+        let project_a_paths = PathList::new(&[Path::new("/project-a")]);
+        let project_b_paths = PathList::new(&[Path::new("/project-b")]);
         let now = Utc::now();
 
-        // Populate the native ThreadStore via save_thread
-        let save1 = cx.update(|cx| {
-            let thread_store = ThreadStore::global(cx);
-            thread_store.update(cx, |store, cx| {
-                store.save_thread(
-                    acp::SessionId::new("session-1"),
-                    make_db_thread("Thread 1", now),
-                    PathList::default(),
-                    cx,
-                )
-            })
-        });
-        save1.await.unwrap();
-        cx.run_until_parked();
-
-        let save2 = cx.update(|cx| {
-            let thread_store = ThreadStore::global(cx);
-            thread_store.update(cx, |store, cx| {
-                store.save_thread(
-                    acp::SessionId::new("session-2"),
-                    make_db_thread("Thread 2", now),
-                    PathList::default(),
-                    cx,
-                )
-            })
-        });
-        save2.await.unwrap();
-        cx.run_until_parked();
-
-        // Run migration
-        cx.update(|cx| {
-            migrate_thread_metadata(cx);
-        });
-
-        cx.run_until_parked();
-
-        // Verify the metadata was migrated
-        let list = cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
-            store.read(cx).entries().collect::<Vec<_>>()
-        });
-        assert_eq!(list.len(), 2);
-
-        let metadata1 = list
-            .iter()
-            .find(|m| m.session_id.0.as_ref() == "session-1")
-            .expect("session-1 should be in migrated metadata");
-        assert_eq!(metadata1.title.as_ref(), "Thread 1");
-        assert!(metadata1.agent_id.is_none());
-
-        let metadata2 = list
-            .iter()
-            .find(|m| m.session_id.0.as_ref() == "session-2")
-            .expect("session-2 should be in migrated metadata");
-        assert_eq!(metadata2.title.as_ref(), "Thread 2");
-        assert!(metadata2.agent_id.is_none());
-    }
-
-    #[gpui::test]
-    async fn test_migrate_thread_metadata_skips_when_data_exists(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            ThreadStore::init_global(cx);
-            SidebarThreadMetadataStore::init_global(cx);
-        });
-
-        // Pre-populate the metadata store with existing data
         let existing_metadata = ThreadMetadata {
-            session_id: acp::SessionId::new("existing-session"),
-            agent_id: None,
-            title: "Existing Thread".into(),
-            updated_at: Utc::now(),
-            created_at: Some(Utc::now()),
-            folder_paths: PathList::default(),
+            session_id: acp::SessionId::new("a-session-0"),
+            agent_id: agent::ZED_AGENT_ID.clone(),
+            title: "Existing Metadata".into(),
+            updated_at: now - chrono::Duration::seconds(10),
+            created_at: Some(now - chrono::Duration::seconds(10)),
+            folder_paths: project_a_paths.clone(),
+            archived: false,
         };
 
         cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
+            let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
-                store.save(existing_metadata, cx).detach();
+                store.save(existing_metadata, cx);
             });
         });
-
         cx.run_until_parked();
 
-        // Add an entry to native thread store that should NOT be migrated
+        let threads_to_save = vec![
+            (
+                "a-session-0",
+                "Thread A0 From Native Store",
+                project_a_paths.clone(),
+                now,
+            ),
+            (
+                "a-session-1",
+                "Thread A1",
+                project_a_paths.clone(),
+                now + chrono::Duration::seconds(1),
+            ),
+            (
+                "b-session-0",
+                "Thread B0",
+                project_b_paths.clone(),
+                now + chrono::Duration::seconds(2),
+            ),
+            (
+                "projectless",
+                "Projectless",
+                PathList::default(),
+                now + chrono::Duration::seconds(3),
+            ),
+        ];
+
+        for (session_id, title, paths, updated_at) in &threads_to_save {
+            let save_task = cx.update(|cx| {
+                let thread_store = ThreadStore::global(cx);
+                let session_id = session_id.to_string();
+                let title = title.to_string();
+                let paths = paths.clone();
+                thread_store.update(cx, |store, cx| {
+                    store.save_thread(
+                        acp::SessionId::new(session_id),
+                        make_db_thread(&title, *updated_at),
+                        paths,
+                        cx,
+                    )
+                })
+            });
+            save_task.await.unwrap();
+            cx.run_until_parked();
+        }
+
+        cx.update(|cx| migrate_thread_metadata(cx));
+        cx.run_until_parked();
+
+        let list = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.read(cx).entries().cloned().collect::<Vec<_>>()
+        });
+
+        assert_eq!(list.len(), 4);
+        assert!(
+            list.iter()
+                .all(|metadata| metadata.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref())
+        );
+
+        let existing_metadata = list
+            .iter()
+            .find(|metadata| metadata.session_id.0.as_ref() == "a-session-0")
+            .unwrap();
+        assert_eq!(existing_metadata.title.as_ref(), "Existing Metadata");
+        assert!(!existing_metadata.archived);
+
+        let migrated_session_ids = list
+            .iter()
+            .map(|metadata| metadata.session_id.0.as_ref())
+            .collect::<Vec<_>>();
+        assert!(migrated_session_ids.contains(&"a-session-1"));
+        assert!(migrated_session_ids.contains(&"b-session-0"));
+        assert!(migrated_session_ids.contains(&"projectless"));
+
+        let migrated_entries = list
+            .iter()
+            .filter(|metadata| metadata.session_id.0.as_ref() != "a-session-0")
+            .collect::<Vec<_>>();
+        assert!(migrated_entries.iter().all(|metadata| metadata.archived));
+    }
+
+    #[gpui::test]
+    async fn test_migrate_thread_metadata_noops_when_all_threads_already_exist(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let project_paths = PathList::new(&[Path::new("/project-a")]);
+        let existing_updated_at = Utc::now();
+
+        let existing_metadata = ThreadMetadata {
+            session_id: acp::SessionId::new("existing-session"),
+            agent_id: agent::ZED_AGENT_ID.clone(),
+            title: "Existing Metadata".into(),
+            updated_at: existing_updated_at,
+            created_at: Some(existing_updated_at),
+            folder_paths: project_paths.clone(),
+            archived: false,
+        };
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(existing_metadata, cx);
+            });
+        });
+        cx.run_until_parked();
+
         let save_task = cx.update(|cx| {
             let thread_store = ThreadStore::global(cx);
             thread_store.update(cx, |store, cx| {
                 store.save_thread(
-                    acp::SessionId::new("native-session"),
-                    make_db_thread("Native Thread", Utc::now()),
-                    PathList::default(),
+                    acp::SessionId::new("existing-session"),
+                    make_db_thread(
+                        "Updated Native Thread Title",
+                        existing_updated_at + chrono::Duration::seconds(1),
+                    ),
+                    project_paths.clone(),
                     cx,
                 )
             })
@@ -831,31 +1094,285 @@ mod tests {
         save_task.await.unwrap();
         cx.run_until_parked();
 
-        // Run migration - should skip because metadata store is not empty
-        cx.update(|cx| {
-            migrate_thread_metadata(cx);
-        });
-
+        cx.update(|cx| migrate_thread_metadata(cx));
         cx.run_until_parked();
 
-        // Verify only the existing metadata is present (migration was skipped)
         let list = cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
-            store.read(cx).entries().collect::<Vec<_>>()
+            let store = ThreadMetadataStore::global(cx);
+            store.read(cx).entries().cloned().collect::<Vec<_>>()
         });
+
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].session_id.0.as_ref(), "existing-session");
     }
 
     #[gpui::test]
-    async fn test_subagent_threads_excluded_from_sidebar_metadata(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            cx.update_flags(true, vec!["agent-v2".to_string()]);
-            ThreadStore::init_global(cx);
-            SidebarThreadMetadataStore::init_global(cx);
+    async fn test_migrate_thread_metadata_archives_beyond_five_most_recent_per_project(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let project_a_paths = PathList::new(&[Path::new("/project-a")]);
+        let project_b_paths = PathList::new(&[Path::new("/project-b")]);
+        let now = Utc::now();
+
+        // Create 7 threads for project A and 3 for project B
+        let mut threads_to_save = Vec::new();
+        for i in 0..7 {
+            threads_to_save.push((
+                format!("a-session-{i}"),
+                format!("Thread A{i}"),
+                project_a_paths.clone(),
+                now + chrono::Duration::seconds(i as i64),
+            ));
+        }
+        for i in 0..3 {
+            threads_to_save.push((
+                format!("b-session-{i}"),
+                format!("Thread B{i}"),
+                project_b_paths.clone(),
+                now + chrono::Duration::seconds(i as i64),
+            ));
+        }
+
+        for (session_id, title, paths, updated_at) in &threads_to_save {
+            let save_task = cx.update(|cx| {
+                let thread_store = ThreadStore::global(cx);
+                let session_id = session_id.to_string();
+                let title = title.to_string();
+                let paths = paths.clone();
+                thread_store.update(cx, |store, cx| {
+                    store.save_thread(
+                        acp::SessionId::new(session_id),
+                        make_db_thread(&title, *updated_at),
+                        paths,
+                        cx,
+                    )
+                })
+            });
+            save_task.await.unwrap();
+            cx.run_until_parked();
+        }
+
+        cx.update(|cx| migrate_thread_metadata(cx));
+        cx.run_until_parked();
+
+        let list = cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.read(cx).entries().cloned().collect::<Vec<_>>()
         });
+
+        assert_eq!(list.len(), 10);
+
+        // Project A: 5 most recent should be unarchived, 2 oldest should be archived
+        let mut project_a_entries: Vec<_> = list
+            .iter()
+            .filter(|m| m.folder_paths == project_a_paths)
+            .collect();
+        assert_eq!(project_a_entries.len(), 7);
+        project_a_entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+        for entry in &project_a_entries[..5] {
+            assert!(
+                !entry.archived,
+                "Expected {} to be unarchived (top 5 most recent)",
+                entry.session_id.0
+            );
+        }
+        for entry in &project_a_entries[5..] {
+            assert!(
+                entry.archived,
+                "Expected {} to be archived (older than top 5)",
+                entry.session_id.0
+            );
+        }
+
+        // Project B: all 3 should be unarchived (under the limit)
+        let project_b_entries: Vec<_> = list
+            .iter()
+            .filter(|m| m.folder_paths == project_b_paths)
+            .collect();
+        assert_eq!(project_b_entries.len(), 3);
+        assert!(project_b_entries.iter().all(|m| !m.archived));
+    }
+
+    #[gpui::test]
+    async fn test_empty_thread_metadata_deleted_when_thread_released(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None::<&Path>, cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::default(), cx)
+            })
+            .await
+            .unwrap();
+        let session_id = cx.read(|cx| thread.read(cx).session_id().clone());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_title("Draft Thread".into(), cx).detach();
+            });
+        });
+        cx.run_until_parked();
+
+        let metadata_ids = cx.update(|cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry_ids()
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(metadata_ids, vec![session_id]);
+
+        drop(thread);
+        cx.update(|_| {});
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        let metadata_ids = cx.update(|cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry_ids()
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            metadata_ids.is_empty(),
+            "expected empty draft thread metadata to be deleted on release"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_nonempty_thread_metadata_preserved_when_thread_released(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None::<&Path>, cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::default(), cx)
+            })
+            .await
+            .unwrap();
+        let session_id = cx.read(|cx| thread.read(cx).session_id().clone());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.push_user_content_block(None, "Hello".into(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let metadata_ids = cx.update(|cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry_ids()
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(metadata_ids, vec![session_id.clone()]);
+
+        drop(thread);
+        cx.update(|_| {});
+        cx.run_until_parked();
+
+        let metadata_ids = cx.update(|cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry_ids()
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(metadata_ids, vec![session_id]);
+    }
+
+    #[gpui::test]
+    async fn test_threads_without_project_association_are_archived_by_default(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project_without_worktree = Project::test(fs.clone(), None::<&Path>, cx).await;
+        let project_with_worktree = Project::test(fs, [Path::new("/project-a")], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+
+        let thread_without_worktree = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project_without_worktree.clone(),
+                    PathList::default(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let session_without_worktree =
+            cx.read(|cx| thread_without_worktree.read(cx).session_id().clone());
+
+        cx.update(|cx| {
+            thread_without_worktree.update(cx, |thread, cx| {
+                thread.set_title("No Project Thread".into(), cx).detach();
+            });
+        });
+        cx.run_until_parked();
+
+        let thread_with_worktree = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project_with_worktree.clone(),
+                    PathList::default(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let session_with_worktree =
+            cx.read(|cx| thread_with_worktree.read(cx).session_id().clone());
+
+        cx.update(|cx| {
+            thread_with_worktree.update(cx, |thread, cx| {
+                thread.set_title("Project Thread".into(), cx).detach();
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let without_worktree = store
+                .entry(&session_without_worktree)
+                .expect("missing metadata for thread without project association");
+            assert!(without_worktree.folder_paths.is_empty());
+            assert!(
+                without_worktree.archived,
+                "expected thread without project association to be archived"
+            );
+
+            let with_worktree = store
+                .entry(&session_with_worktree)
+                .expect("missing metadata for thread with project association");
+            assert_eq!(
+                with_worktree.folder_paths,
+                PathList::new(&[Path::new("/project-a")])
+            );
+            assert!(
+                !with_worktree.archived,
+                "expected thread with project association to remain unarchived"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_subagent_threads_excluded_from_sidebar_metadata(cx: &mut TestAppContext) {
+        init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, None::<&Path>, cx).await;
@@ -888,7 +1405,7 @@ mod tests {
             cx.new(|cx| {
                 acp_thread::AcpThread::new(
                     Some(regular_session_id.clone()),
-                    "Subagent Thread",
+                    Some("Subagent Thread".into()),
                     None,
                     connection.clone(),
                     project.clone(),
@@ -912,8 +1429,8 @@ mod tests {
 
         // List all metadata from the store cache.
         let list = cx.update(|cx| {
-            let store = SidebarThreadMetadataStore::global(cx);
-            store.read(cx).entries().collect::<Vec<_>>()
+            let store = ThreadMetadataStore::global(cx);
+            store.read(cx).entries().cloned().collect::<Vec<_>>()
         });
 
         // The subagent thread should NOT appear in the sidebar metadata.
@@ -927,5 +1444,373 @@ mod tests {
         );
         assert_eq!(list[0].session_id, regular_session_id);
         assert_eq!(list[0].title.as_ref(), "Regular Thread");
+    }
+
+    #[test]
+    fn test_dedup_db_operations_keeps_latest_operation_for_session() {
+        let now = Utc::now();
+
+        let operations = vec![
+            DbOperation::Upsert(make_metadata(
+                "session-1",
+                "First Thread",
+                now,
+                PathList::default(),
+            )),
+            DbOperation::Delete(acp::SessionId::new("session-1")),
+        ];
+
+        let deduped = ThreadMetadataStore::dedup_db_operations(operations);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(
+            deduped[0],
+            DbOperation::Delete(acp::SessionId::new("session-1"))
+        );
+    }
+
+    #[test]
+    fn test_dedup_db_operations_keeps_latest_insert_for_same_session() {
+        let now = Utc::now();
+        let later = now + chrono::Duration::seconds(1);
+
+        let old_metadata = make_metadata("session-1", "Old Title", now, PathList::default());
+        let new_metadata = make_metadata("session-1", "New Title", later, PathList::default());
+
+        let deduped = ThreadMetadataStore::dedup_db_operations(vec![
+            DbOperation::Upsert(old_metadata),
+            DbOperation::Upsert(new_metadata.clone()),
+        ]);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0], DbOperation::Upsert(new_metadata));
+    }
+
+    #[test]
+    fn test_dedup_db_operations_preserves_distinct_sessions() {
+        let now = Utc::now();
+
+        let metadata1 = make_metadata("session-1", "First Thread", now, PathList::default());
+        let metadata2 = make_metadata("session-2", "Second Thread", now, PathList::default());
+        let deduped = ThreadMetadataStore::dedup_db_operations(vec![
+            DbOperation::Upsert(metadata1.clone()),
+            DbOperation::Upsert(metadata2.clone()),
+        ]);
+
+        assert_eq!(deduped.len(), 2);
+        assert!(deduped.contains(&DbOperation::Upsert(metadata1)));
+        assert!(deduped.contains(&DbOperation::Upsert(metadata2)));
+    }
+
+    #[gpui::test]
+    async fn test_archive_and_unarchive_thread(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/project-a")]);
+        let now = Utc::now();
+        let metadata = make_metadata("session-1", "Thread 1", now, paths.clone());
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(metadata, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let path_entries = store
+                .entries_for_path(&paths)
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(path_entries, vec!["session-1"]);
+
+            let archived = store
+                .archived_entries()
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert!(archived.is_empty());
+        });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.archive(&acp::SessionId::new("session-1"), cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let path_entries = store
+                .entries_for_path(&paths)
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert!(path_entries.is_empty());
+
+            let archived = store.archived_entries().collect::<Vec<_>>();
+            assert_eq!(archived.len(), 1);
+            assert_eq!(archived[0].session_id.0.as_ref(), "session-1");
+            assert!(archived[0].archived);
+        });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.unarchive(&acp::SessionId::new("session-1"), cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let path_entries = store
+                .entries_for_path(&paths)
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(path_entries, vec!["session-1"]);
+
+            let archived = store
+                .archived_entries()
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert!(archived.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_entries_for_path_excludes_archived(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/project-a")]);
+        let now = Utc::now();
+
+        let metadata1 = make_metadata("session-1", "Active Thread", now, paths.clone());
+        let metadata2 = make_metadata(
+            "session-2",
+            "Archived Thread",
+            now - chrono::Duration::seconds(1),
+            paths.clone(),
+        );
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(metadata1, cx);
+                store.save(metadata2, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.archive(&acp::SessionId::new("session-2"), cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let path_entries = store
+                .entries_for_path(&paths)
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(path_entries, vec!["session-1"]);
+
+            let all_entries = store
+                .entries()
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(all_entries.len(), 2);
+            assert!(all_entries.contains(&"session-1".to_string()));
+            assert!(all_entries.contains(&"session-2".to_string()));
+
+            let archived = store
+                .archived_entries()
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(archived, vec!["session-2"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_save_all_persists_multiple_threads(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/project-a")]);
+        let now = Utc::now();
+
+        let m1 = make_metadata("session-1", "Thread One", now, paths.clone());
+        let m2 = make_metadata(
+            "session-2",
+            "Thread Two",
+            now - chrono::Duration::seconds(1),
+            paths.clone(),
+        );
+        let m3 = make_metadata(
+            "session-3",
+            "Thread Three",
+            now - chrono::Duration::seconds(2),
+            paths,
+        );
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save_all(vec![m1, m2, m3], cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let all_entries = store
+                .entries()
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(all_entries.len(), 3);
+            assert!(all_entries.contains(&"session-1".to_string()));
+            assert!(all_entries.contains(&"session-2".to_string()));
+            assert!(all_entries.contains(&"session-3".to_string()));
+
+            let entry_ids = store.entry_ids().collect::<Vec<_>>();
+            assert_eq!(entry_ids.len(), 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_archived_flag_persists_across_reload(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/project-a")]);
+        let now = Utc::now();
+        let metadata = make_metadata("session-1", "Thread 1", now, paths.clone());
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(metadata, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.archive(&acp::SessionId::new("session-1"), cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                let _ = store.reload(cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let thread = store
+                .entries()
+                .find(|e| e.session_id.0.as_ref() == "session-1")
+                .expect("thread should exist after reload");
+            assert!(thread.archived);
+
+            let path_entries = store
+                .entries_for_path(&paths)
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert!(path_entries.is_empty());
+
+            let archived = store
+                .archived_entries()
+                .map(|e| e.session_id.0.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(archived, vec!["session-1"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_archive_nonexistent_thread_is_noop(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.archive(&acp::SessionId::new("nonexistent"), cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            assert!(store.is_empty());
+            assert_eq!(store.entries().count(), 0);
+            assert_eq!(store.archived_entries().count(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_save_followed_by_archiving_without_parking(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/project-a")]);
+        let now = Utc::now();
+        let metadata = make_metadata("session-1", "Thread 1", now, paths);
+        let session_id = metadata.session_id.clone();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(metadata.clone(), cx);
+                store.archive(&session_id, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let entries: Vec<ThreadMetadata> = store.entries().cloned().collect();
+            pretty_assertions::assert_eq!(
+                entries,
+                vec![ThreadMetadata {
+                    archived: true,
+                    ..metadata
+                }]
+            );
+        });
     }
 }

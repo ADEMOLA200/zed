@@ -1,4 +1,4 @@
-use crate::word_diff::tokenize;
+use crate::metrics::tokenize;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

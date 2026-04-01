@@ -596,6 +596,7 @@ fn render_ai_section(cx: &mut App) -> impl IntoElement {
                 .grid()
                 .grid_cols(5)
                 .gap_2()
+                .child(agent_button(IconName::ZedAgent, "Zed".into(), false))
                 .child(agent_button(IconName::AiClaude, "Claude".into(), true))
                 .child(agent_button(IconName::AiOpenAi, "Codex".into(), false))
                 .child(agent_button(
@@ -603,7 +604,6 @@ fn render_ai_section(cx: &mut App) -> impl IntoElement {
                     "GitHub Copilot".into(),
                     false,
                 ))
-                .child(agent_button(IconName::AiOpenCode, "OpenCode".into(), false))
                 .child(agent_button(IconName::EditorCursor, "Cursor".into(), false)),
         )
 }

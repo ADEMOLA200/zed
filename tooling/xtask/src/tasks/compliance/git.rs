@@ -41,12 +41,20 @@ impl<G: Subcommand> GitCommand<G> {
             .output()
             .context("Failed to spawn command")?;
 
-        String::from_utf8(command_output.stdout)
-            .map_err(|_| anyhow!("Invalid UTF8"))
-            .and_then(|s| {
-                G::ParsedOutput::from_str(s.trim())
-                    .map_err(|_| anyhow!("Failed to parse from string"))
-            })
+        if command_output.status.success() {
+            String::from_utf8(command_output.stdout)
+                .map_err(|_| anyhow!("Invalid UTF8"))
+                .and_then(|s| {
+                    G::ParsedOutput::from_str(s.trim())
+                        .map_err(|_| anyhow!("Failed to parse from string"))
+                })
+        } else {
+            anyhow::bail!(
+                "Command failed with exit code {}, stderr: {}",
+                command_output.status.code().unwrap_or_default(),
+                String::from_utf8(command_output.stderr).unwrap_or_default()
+            )
+        }
     }
 }
 

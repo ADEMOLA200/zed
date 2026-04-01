@@ -382,6 +382,11 @@ impl MultiWorkspace {
     }
 
     pub fn open_sidebar(&mut self, cx: &mut Context<Self>) {
+        let side = match self.sidebar_side(cx) {
+            SidebarSide::Left => "left",
+            SidebarSide::Right => "right",
+        };
+        telemetry::event!("Sidebar Toggled", action = "open", side = side);
         self.sidebar_open = true;
         let sidebar_focus_handle = self.sidebar.as_ref().map(|s| s.focus_handle(cx));
         for workspace in &self.workspaces {
@@ -394,6 +399,11 @@ impl MultiWorkspace {
     }
 
     pub fn close_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let side = match self.sidebar_side(cx) {
+            SidebarSide::Left => "left",
+            SidebarSide::Right => "right",
+        };
+        telemetry::event!("Sidebar Toggled", action = "close", side = side);
         self.sidebar_open = false;
         for workspace in &self.workspaces {
             workspace.update(cx, |workspace, _cx| {
@@ -466,7 +476,11 @@ impl MultiWorkspace {
             return;
         }
 
+        let is_new = !self.workspaces.iter().any(|w| *w == workspace);
         self.insert_workspace(workspace, window, cx);
+        if is_new {
+            telemetry::event!("Workspace Added", workspace_count = self.workspaces.len());
+        }
     }
 
     /// Ensures the workspace is in the multiworkspace and makes it the active one.

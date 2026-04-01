@@ -1672,10 +1672,7 @@ impl GitRepository for RealGitRepository {
         from_commit: Option<String>,
     ) -> BoxFuture<'_, Result<()>> {
         let git_binary = self.git_binary();
-        let mut args = vec![
-            OsString::from("worktree"),
-            OsString::from("add"),
-        ];
+        let mut args = vec![OsString::from("worktree"), OsString::from("add")];
         if let Some(branch_name) = &branch_name {
             args.push(OsString::from("-b"));
             args.push(OsString::from(branch_name.as_str()));

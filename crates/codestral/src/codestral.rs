@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use text::ToOffset;
+use zed_credentials_provider::global as global_credentials_provider;
 
 pub const CODESTRAL_API_URL: &str = "https://codestral.mistral.ai";
 pub const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(150);
@@ -48,9 +49,10 @@ pub fn codestral_api_key(cx: &App) -> Option<Arc<str>> {
 }
 
 pub fn load_codestral_api_key(cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+    let credentials_provider = global_credentials_provider(cx);
     let api_url = codestral_api_url(cx);
     codestral_api_key_state(cx).update(cx, |key_state, cx| {
-        key_state.load_if_needed(api_url, |s| s, cx)
+        key_state.load_if_needed(api_url, |s| s, credentials_provider, cx)
     })
 }
 

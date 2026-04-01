@@ -260,7 +260,6 @@ dependencies = [
  "chrono",
  "client",
  "collections",
- "credentials_provider",
  "env_logger 0.11.8",
  "feature_flags",
  "fs",
@@ -289,6 +288,7 @@ dependencies = [
  "util",
  "uuid",
  "watch",
+ "zed_credentials_provider",
 ]
 
 [[package]]
@@ -2900,6 +2900,7 @@ dependencies = [
  "util",
  "windows 0.61.3",
  "worktree",
+ "zed_credentials_provider",
 ]
 
 [[package]]
@@ -3059,6 +3060,7 @@ dependencies = [
  "serde",
  "serde_json",
  "text",
+ "zed_credentials_provider",
  "zeta_prompt",
 ]
 
@@ -5115,6 +5117,7 @@ dependencies = [
  "collections",
  "copilot",
  "copilot_ui",
+ "credentials_provider",
  "ctor",
  "db",
  "edit_prediction_context",
@@ -5157,6 +5160,7 @@ dependencies = [
  "workspace",
  "worktree",
  "zed_actions",
+ "zed_credentials_provider",
  "zeta_prompt",
  "zlog",
  "zstd",
@@ -13138,6 +13142,7 @@ dependencies = [
  "wax",
  "which 6.0.3",
  "worktree",
+ "zed_credentials_provider",
  "zeroize",
  "zlog",
  "ztracing",
@@ -15747,6 +15752,7 @@ dependencies = [
  "util",
  "workspace",
  "zed_actions",
+ "zed_credentials_provider",
 ]
 
 [[package]]
@@ -22056,6 +22062,7 @@ dependencies = [
  "workspace",
  "zed-reqwest",
  "zed_actions",
+ "zed_credentials_provider",
  "zed_env_vars",
  "zlog",
  "zlog_settings",
@@ -22178,6 +22185,20 @@ dependencies = [
  "serde",
  "util",
  "uuid",
+]
+
+[[package]]
+name = "zed_credentials_provider"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "credentials_provider",
+ "futures 0.3.31",
+ "gpui",
+ "paths",
+ "release_channel",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

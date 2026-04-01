@@ -11,6 +11,7 @@ use cloud_llm_client::{
 };
 use collections::{HashMap, HashSet};
 use copilot::{Copilot, Reinstall, SignIn, SignOut};
+use credentials_provider::CredentialsProvider;
 use db::kvp::{Dismissable, KeyValueStore};
 use edit_prediction_context::{RelatedExcerptStore, RelatedExcerptStoreEvent, RelatedFile};
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _};
@@ -150,6 +151,7 @@ pub struct EditPredictionStore {
     rated_predictions: HashSet<EditPredictionId>,
     #[cfg(test)]
     settled_event_callback: Option<Box<dyn Fn(EditPredictionId, String)>>,
+    credentials_provider: Arc<dyn CredentialsProvider>,
 }
 
 pub(crate) struct EditPredictionRejectionPayload {
@@ -787,6 +789,8 @@ impl EditPredictionStore {
             .log_err();
         });
 
+        let credentials_provider = zed_credentials_provider::global(cx);
+
         let this = Self {
             projects: HashMap::default(),
             client,
@@ -807,6 +811,8 @@ impl EditPredictionStore {
             shown_predictions: Default::default(),
             #[cfg(test)]
             settled_event_callback: None,
+
+            credentials_provider,
         };
 
         this
@@ -2315,7 +2321,10 @@ impl EditPredictionStore {
                 zeta::request_prediction_with_zeta(self, inputs, capture_data, cx)
             }
             EditPredictionModel::Fim { format } => fim::request_prediction(inputs, format, cx),
-            EditPredictionModel::Mercury => self.mercury.request_prediction(inputs, cx),
+            EditPredictionModel::Mercury => {
+                self.mercury
+                    .request_prediction(inputs, self.credentials_provider.clone(), cx)
+            }
         };
 
         cx.spawn(async move |this, cx| {

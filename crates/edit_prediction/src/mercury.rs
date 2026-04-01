@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result};
 use cloud_llm_client::EditPredictionRejectReason;
+use credentials_provider::CredentialsProvider;
 use futures::AsyncReadExt as _;
 use gpui::{
     App, AppContext as _, Context, Entity, Global, SharedString, Task,
@@ -15,6 +16,7 @@ use language_model::{ApiKeyState, EnvVar, env_var};
 use release_channel::AppVersion;
 use serde::{Deserialize, Serialize};
 use std::{mem, ops::Range, path::Path, sync::Arc};
+use zed_credentials_provider::global as global_credentials_provider;
 use zeta_prompt::ZetaPromptInput;
 
 const MERCURY_API_URL: &str = "https://api.inceptionlabs.ai/v1/edit/completions";
@@ -51,10 +53,11 @@ impl Mercury {
             debug_tx,
             ..
         }: EditPredictionModelInput,
+        credentials_provider: Arc<dyn CredentialsProvider>,
         cx: &mut Context<EditPredictionStore>,
     ) -> Task<Result<Option<EditPredictionResult>>> {
         self.api_token.update(cx, |key_state, cx| {
-            _ = key_state.load_if_needed(MERCURY_CREDENTIALS_URL, |s| s, cx);
+            _ = key_state.load_if_needed(MERCURY_CREDENTIALS_URL, |s| s, credentials_provider, cx);
         });
         let Some(api_token) = self.api_token.read(cx).key(&MERCURY_CREDENTIALS_URL) else {
             return Task::ready(Ok(None));
@@ -387,8 +390,9 @@ pub fn mercury_api_token(cx: &mut App) -> Entity<ApiKeyState> {
 }
 
 pub fn load_mercury_api_token(cx: &mut App) -> Task<Result<(), language_model::AuthenticateError>> {
+    let credentials_provider = global_credentials_provider(cx);
     mercury_api_token(cx).update(cx, |key_state, cx| {
-        key_state.load_if_needed(MERCURY_CREDENTIALS_URL, |s| s, cx)
+        key_state.load_if_needed(MERCURY_CREDENTIALS_URL, |s| s, credentials_provider, cx)
     })
 }
 

@@ -2263,25 +2263,47 @@ impl Sidebar {
 
             for path in &paths {
                 let path_str = path.to_string_lossy().to_string();
-                let archived_worktree = store
+                let archived_worktree = match store
                     .update(cx, |store, cx| {
                         store.get_archived_worktree_by_path(path_str, cx)
                     })
-                    .await?;
+                    .await
+                {
+                    Ok(row) => row,
+                    Err(err) => {
+                        log::error!(
+                            "Failed to query archived worktree for {}: {err}",
+                            path.display()
+                        );
+                        final_paths.push(path.clone());
+                        continue;
+                    }
+                };
 
                 match archived_worktree {
                     None => {
-                        // No archived worktree record — keep the original path.
                         final_paths.push(path.clone());
                     }
                     Some(row) => {
-                        // Restore from WIP commit.
-                        let restored_path =
-                            Self::restore_archived_worktree(&row, &workspaces, cx).await?;
-                        final_paths.push(restored_path);
-
-                        // Clean up the archived worktree record and ref.
-                        Self::maybe_cleanup_archived_worktree(&row, &store, &workspaces, cx).await;
+                        match Self::restore_archived_worktree(&row, &workspaces, cx).await {
+                            Ok(restored_path) => {
+                                final_paths.push(restored_path);
+                                Self::maybe_cleanup_archived_worktree(
+                                    &row,
+                                    &store,
+                                    &workspaces,
+                                    cx,
+                                )
+                                .await;
+                            }
+                            Err(err) => {
+                                log::error!(
+                                    "Failed to restore archived worktree for {}: {err}",
+                                    path.display()
+                                );
+                                final_paths.push(path.clone());
+                            }
+                        }
                     }
                 }
             }

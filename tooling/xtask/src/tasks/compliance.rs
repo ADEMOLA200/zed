@@ -75,7 +75,7 @@ impl ComplianceArgs {
 }
 
 async fn check_compliance_impl(args: ComplianceArgs) -> Result<()> {
-    let in_workflow_context = true || std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true");
+    let in_workflow_context = std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true");
     let tag = args.previous_version_tag();
 
     if !in_workflow_context {

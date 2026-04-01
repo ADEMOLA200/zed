@@ -1,11 +1,11 @@
-use std::time::Duration;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use semver::Version;
 
 use crate::tasks::compliance::{
-    git::{CommitSha, CommitsBetweenCommits, GitCommand, VersionTag},
+    git::{CommitsBetweenCommits, GitCommand, VersionTag},
     github::GitHubClient,
     report::Reporter,
 };
@@ -37,6 +37,9 @@ pub struct ComplianceArgs {
     #[arg(value_enum, default_value_t = ReleaseChannel::Stable)]
     // The release channel to check compliance for
     release_channel: ReleaseChannel,
+    #[arg(long, default_value = "compliance-report.md")]
+    // The markdown file to write the compliance report to
+    report_path: PathBuf,
 }
 
 impl ComplianceArgs {
@@ -65,7 +68,7 @@ async fn check_compliance_impl(args: ComplianceArgs) -> Result<()> {
     let mut commits = GitCommand::new(CommitsBetweenCommits(tag.clone())).run()?;
 
     //TODO REMOVE REMOVE REMOVE REMOVE!
-    let _ = commits.split_off(30);
+    let _ = commits.split_off(60);
 
     println!("Found {} commits to check", commits.len());
 
@@ -79,16 +82,9 @@ async fn check_compliance_impl(args: ComplianceArgs) -> Result<()> {
     println!("Initialized GitHub client for app ID {APP_ID}");
 
     let report = Reporter::new(commits, client).generate_report().await?;
+    report.write_markdown(&args.report_path)?;
 
-    dbg!(report);
-
-    // dbg!(
-    //     client
-    //         .get_commit_co_authors([&CommitSha(
-    //             "d77aba3ee721e4b93c9deb937739eed3b602df45".to_owned(),
-    //         )])
-    //         .await
-    // );
+    println!("Wrote compliance report to {}", args.report_path.display());
 
     Ok(())
 }

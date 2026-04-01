@@ -1,7 +1,14 @@
-use std::{fmt::Debug, ops::Not, process::Command, str::FromStr, sync::LazyLock};
+use std::{
+    fmt::{self, Debug},
+    ops::Not,
+    process::Command,
+    str::FromStr,
+    sync::LazyLock,
+};
 
 use anyhow::{Context, Result, anyhow};
 use derive_more::{Deref, DerefMut, FromStr};
+
 use itertools::Itertools;
 use regex::Regex;
 use serde::Deserialize;
@@ -59,17 +66,18 @@ impl Subcommand for CommitForTag {
 #[derive(Debug)]
 pub(crate) struct CommitDetails {
     sha: CommitSha,
+    author: Committer,
     title: String,
     body: String,
 }
 
-#[derive(Debug)]
-pub(crate) struct CoAuthor {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Committer {
     name: String,
     email: String,
 }
 
-impl CoAuthor {
+impl Committer {
     pub(crate) fn new(name: &str, email: &str) -> Self {
         Self {
             name: name.to_owned(),
@@ -78,17 +86,28 @@ impl CoAuthor {
     }
 }
 
+impl fmt::Display for Committer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} ({})", self.name, self.email)
+    }
+}
+
 impl CommitDetails {
     const BODY_DELIMITER: &str = "|body-delimiter|";
     const COMMIT_DELIMITER: &str = "|commit-delimiter|";
-    const FORMAT_STRING: &str = "%H %s|body-delimiter|%b|commit-delimiter|";
+    const FIELD_DELIMITER: &str = "|field-delimiter|";
+    const FORMAT_STRING: &str = "%H|field-delimiter|%an|field-delimiter|%ae|field-delimiter|%s|body-delimiter|%b|commit-delimiter|";
 
     fn parse(line: &str, body: &str) -> Result<Self, anyhow::Error> {
-        let Some((sha, title)) = line.split_once(' ') else {
-            return Err(anyhow!("Failed to parse input {line}"));
+        let Some([sha, author_name, author_email, title]) =
+            line.splitn(4, Self::FIELD_DELIMITER).collect_array()
+        else {
+            return Err(anyhow!("Failed to parse commit fields from input {line}"));
         };
+
         Ok(CommitDetails {
             sha: CommitSha(sha.to_owned()),
+            author: Committer::new(author_name, author_email),
             title: title.to_owned(),
             body: body.to_owned(),
         })
@@ -109,13 +128,9 @@ impl CommitDetails {
             .and_then(|range| self.title[range].parse().ok())
     }
 
-    pub(crate) fn co_authors(&self) -> Option<Vec<CoAuthor>> {
+    pub(crate) fn co_authors(&self) -> Option<Vec<Committer>> {
         static CO_AUTHOR_REGEX: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"Co-authored-by: (.+) <(.+)>").unwrap());
-
-        // if self.pr_number() == Some(52524) {
-        //     dbg!(CO_AUTHOR_REGEX.captures(&self.body.as_ref()));
-        // }
 
         let mut co_authors = Vec::new();
 
@@ -127,14 +142,18 @@ impl CommitDetails {
             else {
                 continue;
             };
-            co_authors.push(CoAuthor::new(name, email));
+            co_authors.push(Committer::new(name, email));
         }
 
         co_authors.is_empty().not().then_some(co_authors)
     }
 
-    pub(crate) fn body(&self) -> &str {
-        &self.body
+    pub(crate) fn author(&self) -> &Committer {
+        &self.author
+    }
+
+    pub(crate) fn title(&self) -> &str {
+        &self.title
     }
 
     pub(crate) fn sha(&self) -> &CommitSha {

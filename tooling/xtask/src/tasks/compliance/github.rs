@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     ops::Not,
 };
 
@@ -7,7 +8,10 @@ use anyhow::{Context, Result};
 use derive_more::Deref;
 use itertools::Itertools;
 use jsonwebtoken::EncodingKey;
-use octocrab::{Octocrab, Page, models::pulls::Review};
+use octocrab::{
+    Octocrab, Page,
+    models::pulls::{PullRequest, Review},
+};
 use serde::Deserialize;
 
 use crate::tasks::compliance::git::CommitSha;
@@ -21,15 +25,6 @@ pub struct GitHubClient {
     organization_members: Option<HashSet<String>>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Deserialize)]
-enum Role {
-    Admin,
-    #[serde(rename = "User")]
-    Member,
-    #[serde(untagged)]
-    Other(String),
-}
-
 #[derive(Debug, Deserialize, Clone, Deref, PartialEq, Eq)]
 pub(crate) struct GithubLogin {
     login: String,
@@ -38,6 +33,12 @@ pub(crate) struct GithubLogin {
 impl GithubLogin {
     pub(crate) fn new(login: String) -> Self {
         Self { login }
+    }
+}
+
+impl fmt::Display for GithubLogin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "@{}", self.login)
     }
 }
 
@@ -60,6 +61,15 @@ impl PartialEq for CommitAuthor {
             || self.email == other.email || self.name == other.name,
             |(l, r)| l == r,
         )
+    }
+}
+
+impl fmt::Display for CommitAuthor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.user.as_ref() {
+            Some(user) => write!(formatter, "{} ({user})", self.name),
+            None => write!(formatter, "{} ({})", self.name, self.email),
+        }
     }
 }
 
@@ -196,6 +206,10 @@ impl GitHubClient {
         self.client.graphql(query).await
     }
 
+    pub async fn get_pull_request(&self, pr_number: u64) -> octocrab::Result<PullRequest> {
+        self.client.pulls(ORG, REPO).get(pr_number).await
+    }
+
     pub async fn get_pr_reviews(&self, pr_number: u64) -> octocrab::Result<Page<Review>> {
         // TODO! pagination
         self.client
@@ -209,10 +223,10 @@ impl GitHubClient {
     pub async fn get_pr_comments(
         &self,
         pr_number: u64,
-    ) -> octocrab::Result<Page<octocrab::models::pulls::Comment>> {
+    ) -> octocrab::Result<Page<octocrab::models::issues::Comment>> {
         self.client
-            .pulls(ORG, REPO)
-            .list_comments(Some(pr_number))
+            .issues(ORG, REPO)
+            .list_comments(pr_number)
             .per_page(PAGE_SIZE)
             .send()
             .await

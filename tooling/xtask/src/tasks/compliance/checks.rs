@@ -1,0 +1,242 @@
+use std::{fmt, ops::Not as _, time::Duration};
+
+use itertools::Itertools as _;
+use octocrab::models::{
+    Author,
+    issues::Comment,
+    pulls::{Review, ReviewState},
+};
+
+use crate::tasks::compliance::{
+    git::{CommitDetails, CommitList},
+    github::{CommitAuthor, GitHubClient, GithubLogin},
+    report::Report,
+};
+
+const ZED_ZIPPY_COMMENT_APPROVAL_PATTERN: &str = "@zed-zippy approved";
+
+#[derive(Debug)]
+pub(crate) enum ReviewSuccess {
+    ApprovingComment(Vec<Comment>),
+    CoAuthored(Vec<CommitAuthor>),
+    ExternalMergedContribution { merged_by: Box<Author> },
+    PullRequestReviewed(Vec<Review>),
+}
+
+impl ReviewSuccess {
+    pub(crate) fn reviewers(&self) -> anyhow::Result<String> {
+        let reviewers = match self {
+            Self::CoAuthored(authors) => authors.iter().map(ToString::to_string).collect_vec(),
+            Self::PullRequestReviewed(reviews) => reviews
+                .iter()
+                .filter_map(|review| review.user.as_ref())
+                .map(|user| format!("@{}", user.login))
+                .collect_vec(),
+            Self::ApprovingComment(comments) => comments
+                .iter()
+                .map(|comment| format!("@{}", comment.user.login))
+                .collect_vec(),
+            Self::ExternalMergedContribution { merged_by } => vec![format!("@{}", merged_by.login)],
+        };
+
+        let reviewers = reviewers.into_iter().unique().collect_vec();
+
+        reviewers
+            .is_empty()
+            .not()
+            .then(|| reviewers.join(", "))
+            .ok_or_else(|| anyhow::anyhow!("Expected at least one reviewer"))
+    }
+}
+
+impl fmt::Display for ReviewSuccess {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CoAuthored(_) => formatter.write_str("Co-authored by an organization member"),
+            Self::PullRequestReviewed(_) => {
+                formatter.write_str("Approved by an organization review")
+            }
+            Self::ApprovingComment(_) => {
+                formatter.write_str("Approved by an organization approval comment")
+            }
+            Self::ExternalMergedContribution { .. } => {
+                formatter.write_str("External merged contribution")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ReviewFailure {
+    // todo: We could still query the GitHub API here to search for one
+    NoPullRequestFound,
+    Unreviewed,
+    UnableToDetermineReviewer,
+    Other(anyhow::Error),
+}
+
+impl fmt::Display for ReviewFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoPullRequestFound => formatter.write_str("No pull request found"),
+            Self::Unreviewed => formatter
+                .write_str("No qualifying organization approval found for the pull request"),
+            Self::UnableToDetermineReviewer => formatter.write_str("Could not determine reviewer"),
+            Self::Other(error) => write!(formatter, "Failed to inspect review state: {error}"),
+        }
+    }
+}
+
+pub(crate) type ReviewResult = Result<ReviewSuccess, ReviewFailure>;
+
+impl<E: Into<anyhow::Error>> From<E> for ReviewFailure {
+    fn from(err: E) -> Self {
+        Self::Other(anyhow::anyhow!(err))
+    }
+}
+
+pub(crate) struct Reporter {
+    commits: CommitList,
+    github_client: GitHubClient,
+}
+
+impl Reporter {
+    pub fn new(commits: CommitList, github_client: GitHubClient) -> Self {
+        Self {
+            commits,
+            github_client,
+        }
+    }
+
+    async fn check_commit(
+        &mut self,
+        commit: &CommitDetails,
+    ) -> Result<ReviewSuccess, ReviewFailure> {
+        // Check co-authors first
+        if commit.co_authors().is_some()
+            && let Some(commit_authors) = self
+                .github_client
+                .get_commit_co_authors([commit.sha()])
+                .await?
+                .get(commit.sha())
+                .and_then(|authors| authors.co_authors())
+        {
+            let mut org_co_authors = Vec::new();
+            for co_author in commit_authors {
+                if let Some(github_login) = co_author.user()
+                    && self
+                        .github_client
+                        .check_org_membership(github_login)
+                        .await?
+                {
+                    org_co_authors.push(co_author.clone());
+                }
+            }
+
+            if org_co_authors.is_empty().not() {
+                return Ok(ReviewSuccess::CoAuthored(org_co_authors));
+            }
+        }
+
+        let Some(pr_number) = commit.pr_number() else {
+            return Err(ReviewFailure::NoPullRequestFound);
+        };
+
+        let pull_request = self.github_client.get_pull_request(pr_number).await?;
+
+        if let Some(user) = pull_request.user
+            && self
+                .github_client
+                .check_org_membership(&GithubLogin::new(user.login))
+                .await?
+                .not()
+        {
+            if let Some(merged_by) = pull_request.merged_by {
+                return Ok(ReviewSuccess::ExternalMergedContribution { merged_by });
+            } else {
+                return Err(ReviewFailure::UnableToDetermineReviewer);
+            }
+        }
+
+        let other_comments = self
+            .github_client
+            .get_pr_reviews(pr_number)
+            .await?
+            .take_items();
+
+        if !other_comments.is_empty() {
+            let mut org_approving_reviews = Vec::new();
+            for review in other_comments {
+                if let Some(github_login) = review.user.as_ref()
+                    && review
+                        .state
+                        .is_some_and(|state| state == ReviewState::Approved)
+                    && self
+                        .github_client
+                        .check_org_membership(&GithubLogin::new(github_login.login.clone()))
+                        .await?
+                {
+                    org_approving_reviews.push(review);
+                }
+            }
+
+            if org_approving_reviews.is_empty().not() {
+                return Ok(ReviewSuccess::PullRequestReviewed(org_approving_reviews));
+            }
+        }
+
+        let other_comments = self
+            .github_client
+            .get_pr_comments(pr_number)
+            .await?
+            .take_items();
+
+        if !other_comments.is_empty() {
+            let mut org_approving_comments = Vec::new();
+
+            for comment in other_comments {
+                if comment
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| body.contains(ZED_ZIPPY_COMMENT_APPROVAL_PATTERN))
+                    && self
+                        .github_client
+                        .check_org_membership(&GithubLogin::new(comment.user.login.clone()))
+                        .await?
+                {
+                    org_approving_comments.push(comment);
+                }
+            }
+
+            if org_approving_comments.is_empty().not() {
+                return Ok(ReviewSuccess::ApprovingComment(org_approving_comments));
+            }
+        }
+
+        Err(ReviewFailure::Unreviewed)
+    }
+
+    pub(crate) async fn generate_report(&mut self) -> anyhow::Result<Report> {
+        let mut report = Report::new();
+
+        let commits_to_check = std::mem::take(&mut self.commits);
+        let total_commits = commits_to_check.len();
+
+        for (i, commit) in commits_to_check.into_iter().enumerate() {
+            println!(
+                "Checking commit {:?} ({current}/{total})",
+                commit.sha().as_str().split_at(8).0,
+                current = i + 1,
+                total = total_commits
+            );
+
+            let review_result = self.check_commit(&commit).await;
+
+            report.add(commit, review_result);
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        Ok(report)
+    }
+}

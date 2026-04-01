@@ -5,11 +5,12 @@ use clap::{Parser, ValueEnum};
 use semver::Version;
 
 use crate::tasks::compliance::{
+    checks::Reporter,
     git::{CommitsBetweenCommits, GitCommand, VersionTag},
     github::GitHubClient,
-    report::Reporter,
 };
 
+mod checks;
 mod git;
 mod github;
 mod report;
@@ -82,11 +83,23 @@ async fn check_compliance_impl(args: ComplianceArgs) -> Result<()> {
     println!("Initialized GitHub client for app ID {APP_ID}");
 
     let report = Reporter::new(commits, client).generate_report().await?;
+
+    let summary = report.summary();
+
     report.write_markdown(&args.report_path)?;
 
     println!("Wrote compliance report to {}", args.report_path.display());
 
-    Ok(())
+    if summary.no_issues() {
+        println!("No issues found, compliance check passed.");
+        return Ok(());
+    } else {
+        println!("Issues found, compliance check failed.");
+        return Err(anyhow::anyhow!(
+            "Compliance check failed with {} issues",
+            summary.errors
+        ));
+    }
 }
 
 pub fn check_compliance(args: ComplianceArgs) -> Result<()> {

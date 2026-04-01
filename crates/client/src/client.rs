@@ -339,7 +339,7 @@ pub struct ClientCredentialsProvider {
 impl ClientCredentialsProvider {
     pub fn new(cx: &App) -> Self {
         Self {
-            provider: <dyn CredentialsProvider>::global(cx),
+            provider: zed_credentials_provider::global(cx),
         }
     }
 
@@ -566,6 +566,10 @@ impl Client {
 
     pub fn http_client(&self) -> Arc<HttpClientWithUrl> {
         self.http.clone()
+    }
+
+    pub fn credentials_provider(&self) -> Arc<dyn CredentialsProvider> {
+        self.credentials_provider.provider.clone()
     }
 
     pub fn cloud_client(&self) -> Arc<CloudApiClient> {

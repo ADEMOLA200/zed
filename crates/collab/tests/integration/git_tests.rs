@@ -214,7 +214,7 @@ async fn test_remote_git_worktrees(
     cx_b.update(|cx| {
         repo_b.update(cx, |repository, _| {
             repository.create_worktree(
-                Some("feature-branch".to_string()),
+                "feature-branch".to_string(),
                 worktree_directory.join("feature-branch"),
                 Some("abc123".to_string()),
             )
@@ -268,7 +268,7 @@ async fn test_remote_git_worktrees(
     cx_b.update(|cx| {
         repo_b.update(cx, |repository, _| {
             repository.create_worktree(
-                Some("bugfix-branch".to_string()),
+                "bugfix-branch".to_string(),
                 worktree_directory.join("bugfix-branch"),
                 None,
             )

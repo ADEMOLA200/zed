@@ -254,8 +254,8 @@ pub fn setup_sccache(platform: Platform) -> Step<Run> {
         .add_env(("SCCACHE_BUCKET", SCCACHE_R2_BUCKET))
 }
 
-pub fn cargo_run_visual_tests() -> Step<Run> {
-    named::bash("cargo run -p zed --bin zed_visual_test_runner --features visual-tests")
+pub fn cargo_build_visual_tests() -> Step<Run> {
+    named::bash("cargo build -p zed --bin zed_visual_test_runner --features visual-tests")
 }
 
 pub fn show_sccache_stats(platform: Platform) -> Step<Run> {

@@ -11,12 +11,10 @@ pub mod tool_schema;
 pub mod fake_provider;
 
 use anyhow::{Result, anyhow};
-use client::Client;
-use client::UserStore;
 use cloud_llm_client::CompletionRequestStatus;
 use futures::FutureExt;
 use futures::{StreamExt, future::BoxFuture, stream::BoxStream};
-use gpui::{AnyView, App, AsyncApp, Entity, SharedString, Task, Window};
+use gpui::{AnyView, App, AsyncApp, SharedString, Task, Window};
 use http_client::{StatusCode, http};
 use icons::IconName;
 use parking_lot::Mutex;
@@ -39,12 +37,7 @@ pub use crate::tool_schema::LanguageModelToolSchemaFormat;
 pub use env_var::{EnvVar, env_var};
 pub use provider::*;
 
-pub fn init(user_store: Entity<UserStore>, client: Arc<Client>, cx: &mut App) {
-    init_settings(cx);
-    RefreshLlmTokenListener::register(client, user_store, cx);
-}
-
-pub fn init_settings(cx: &mut App) {
+pub fn init(cx: &mut App) {
     registry::init(cx);
 }
 

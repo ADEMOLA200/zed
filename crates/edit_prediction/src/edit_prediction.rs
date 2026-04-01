@@ -1,5 +1,8 @@
 use anyhow::Result;
-use client::{Client, EditPredictionUsage, UserStore};
+use client::{
+    Client, EditPredictionUsage, NeedsLlmTokenRefresh, UserStore,
+    global_llm_token as global_llm_api_token,
+};
 use cloud_api_types::{OrganizationId, SubmitEditPredictionFeedbackBody};
 use cloud_llm_client::predict_edits_v3::{
     PredictEditsV3Request, PredictEditsV3Response, RawCompletionRequest, RawCompletionResponse,
@@ -31,7 +34,7 @@ use heapless::Vec as ArrayVec;
 use language::language_settings::all_language_settings;
 use language::{Anchor, Buffer, File, Point, TextBufferSnapshot, ToOffset, ToPoint};
 use language::{BufferSnapshot, OffsetRangeExt};
-use language_model::{LlmApiToken, NeedsLlmTokenRefresh};
+use language_model::LlmApiToken;
 use project::{DisableAiSettings, Project, ProjectPath, WorktreeId};
 use release_channel::AppVersion;
 use semver::Version;
@@ -748,7 +751,7 @@ impl EditPredictionStore {
     pub fn new(client: Arc<Client>, user_store: Entity<UserStore>, cx: &mut Context<Self>) -> Self {
         let data_collection_choice = Self::load_data_collection_choice(cx);
 
-        let llm_token = LlmApiToken::global(cx);
+        let llm_token = global_llm_api_token(cx);
 
         let (reject_tx, reject_rx) = mpsc::unbounded();
         cx.background_spawn({
@@ -877,7 +880,9 @@ impl EditPredictionStore {
             let experiments = cx
                 .background_spawn(async move {
                     let http_client = client.http_client();
-                    let token = llm_token.acquire(&client, organization_id).await?;
+                    let token = client
+                        .acquire_llm_token(&llm_token, organization_id.clone())
+                        .await?;
                     let url = http_client.build_zed_llm_url("/edit_prediction_experiments", &[])?;
                     let request = http_client::Request::builder()
                         .method(Method::GET)
@@ -2539,12 +2544,15 @@ impl EditPredictionStore {
         Res: DeserializeOwned,
     {
         let http_client = client.http_client();
-
         let mut token = if require_auth {
-            Some(llm_token.acquire(&client, organization_id.clone()).await?)
+            Some(
+                client
+                    .acquire_llm_token(&llm_token, organization_id.clone())
+                    .await?,
+            )
         } else {
-            llm_token
-                .acquire(&client, organization_id.clone())
+            client
+                .acquire_llm_token(&llm_token, organization_id.clone())
                 .await
                 .ok()
         };
@@ -2588,7 +2596,11 @@ impl EditPredictionStore {
                 return Ok((serde_json::from_slice(&body)?, usage));
             } else if !did_retry && token.is_some() && response.needs_llm_token_refresh() {
                 did_retry = true;
-                token = Some(llm_token.refresh(&client, organization_id.clone()).await?);
+                token = Some(
+                    client
+                        .refresh_llm_token(&llm_token, organization_id.clone())
+                        .await?,
+                );
             } else {
                 let mut body = String::new();
                 response.body_mut().read_to_string(&mut body).await?;

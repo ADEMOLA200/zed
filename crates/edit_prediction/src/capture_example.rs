@@ -1,6 +1,8 @@
 use crate::{StoredEvent, example_spec::ExampleSpec};
 use anyhow::Result;
 use buffer_diff::BufferDiffSnapshot;
+#[cfg(test)]
+use client::RefreshLlmTokenListener;
 use collections::HashMap;
 use gpui::{App, Entity, Task};
 use language::Buffer;
@@ -548,7 +550,8 @@ mod tests {
             let http_client = FakeHttpClient::with_404_response();
             let client = Client::new(Arc::new(FakeSystemClock::new()), http_client, cx);
             let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
-            language_model::init(user_store.clone(), client.clone(), cx);
+            language_model::init(cx);
+            RefreshLlmTokenListener::register(client.clone(), user_store.clone(), cx);
             EditPredictionStore::global(&client, &user_store, cx);
         })
     }

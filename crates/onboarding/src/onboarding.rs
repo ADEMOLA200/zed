@@ -16,6 +16,7 @@ use ui::{
     Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement, Vector, VectorName,
     WithScrollbar as _, prelude::*, rems_from_px,
 };
+use workspace::ToggleWorkspaceSidebar;
 pub use workspace::welcome::ShowWelcome;
 use workspace::welcome::WelcomePage;
 use workspace::{
@@ -26,6 +27,7 @@ use workspace::{
     open_new, register_serializable_item, with_active_or_new_workspace,
 };
 use zed_actions::OpenOnboarding;
+use zed_actions::assistant::ToggleFocus as ToggleAgentPanel;
 
 mod base_keymap_picker;
 mod basics_page;
@@ -329,15 +331,12 @@ impl Render for Onboarding {
                                         Button::new("finish_setup", "Finish Setup")
                                             .style(ButtonStyle::Filled)
                                             .size(ButtonSize::Medium)
-                                            .width(Rems(12.0))
-                                            .key_binding(
-                                                KeyBinding::for_action_in(
-                                                    &Finish,
-                                                    &self.focus_handle,
-                                                    cx,
-                                                )
-                                                .size(rems_from_px(12.)),
-                                            )
+                                            .width(rems_from_px(200.))
+                                            .key_binding(KeyBinding::for_action_in(
+                                                &Finish,
+                                                &self.focus_handle,
+                                                cx,
+                                            ))
                                             .on_click(|_, window, cx| {
                                                 window.dispatch_action(Finish.boxed_clone(), cx);
                                             })

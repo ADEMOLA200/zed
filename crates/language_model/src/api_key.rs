@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use credentials_provider::CredentialsProvider;
+use env_var::EnvVar;
 use futures::{FutureExt, future};
 use gpui::{AsyncApp, Context, SharedString, Task};
 use std::{
@@ -7,7 +8,6 @@ use std::{
     sync::Arc,
 };
 use util::ResultExt as _;
-use zed_env_vars::EnvVar;
 
 use crate::AuthenticateError;
 

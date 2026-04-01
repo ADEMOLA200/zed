@@ -61,6 +61,7 @@ members = [
     "crates/edit_prediction_ui",
     "crates/editor",
     "crates/encoding_selector",
+    "crates/env_var",
     "crates/etw_tracing",
     "crates/eval_cli",
     "crates/eval_utils",
@@ -310,6 +311,7 @@ dev_container = { path = "crates/dev_container" }
 diagnostics = { path = "crates/diagnostics" }
 editor = { path = "crates/editor" }
 encoding_selector = { path = "crates/encoding_selector" }
+env_var = { path = "crates/env_var" }
 etw_tracing = { path = "crates/etw_tracing" }
 eval_utils = { path = "crates/eval_utils" }
 extension = { path = "crates/extension" }

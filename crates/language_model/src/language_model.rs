@@ -36,8 +36,8 @@ pub use crate::registry::*;
 pub use crate::request::*;
 pub use crate::role::*;
 pub use crate::tool_schema::LanguageModelToolSchemaFormat;
+pub use env_var::{EnvVar, env_var};
 pub use provider::*;
-pub use zed_env_vars::{EnvVar, env_var};
 
 pub fn init(user_store: Entity<UserStore>, client: Arc<Client>, cx: &mut App) {
     init_settings(cx);

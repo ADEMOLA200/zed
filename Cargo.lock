@@ -5587,6 +5587,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_var"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+]
+
+[[package]]
 name = "envy"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9326,6 +9333,7 @@ dependencies = [
  "cloud_llm_client",
  "collections",
  "credentials_provider",
+ "env_var",
  "futures 0.3.31",
  "gpui",
  "http_client",
@@ -9341,7 +9349,6 @@ dependencies = [
  "smol",
  "thiserror 2.0.17",
  "util",
- "zed_env_vars",
 ]
 
 [[package]]
@@ -22205,7 +22212,7 @@ dependencies = [
 name = "zed_env_vars"
 version = "0.1.0"
 dependencies = [
- "gpui",
+ "env_var",
 ]
 
 [[package]]

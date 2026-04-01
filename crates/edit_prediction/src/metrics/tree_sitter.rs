@@ -1,13 +1,7 @@
-use std::ops::Range;
+use language::SyntaxLayer;
 
-use language::BufferSnapshot;
-
-pub fn ts_error_count_in_range(
-    edited_buffer_snapshot: &BufferSnapshot,
-    range: Range<usize>,
-) -> usize {
-    edited_buffer_snapshot
-        .syntax_layers_for_range(range, true)
+pub fn count_tree_sitter_errors<'a>(layers: impl Iterator<Item = SyntaxLayer<'a>>) -> usize {
+    layers
         .map(|layer| {
             let node = layer.node();
             let mut count = 0;
@@ -41,9 +35,16 @@ pub fn ts_error_count_in_range(
 
 #[cfg(test)]
 mod tests {
-    use super::ts_error_count_in_range;
+    use std::ops::Range;
+
+    use super::count_tree_sitter_errors;
     use gpui::{AppContext as _, TestAppContext};
     use language::{Buffer, BufferSnapshot, rust_lang};
+
+    fn error_count_in_range(edited_buffer_snapshot: &BufferSnapshot, range: Range<usize>) -> usize {
+        let layers = edited_buffer_snapshot.syntax_layers_for_range(range, true);
+        count_tree_sitter_errors(layers)
+    }
 
     fn rust_snapshot(text: &str, cx: &mut TestAppContext) -> BufferSnapshot {
         let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(rust_lang(), cx));
@@ -58,10 +59,7 @@ mod tests {
         let text = "fn helper(value: usize) -> usize {\n    value + 1\n}\n";
         let snapshot = rust_snapshot(text, cx);
 
-        assert_eq!(
-            ts_error_count_in_range(&snapshot, 0..snapshot.text.len()),
-            0
-        );
+        assert_eq!(error_count_in_range(&snapshot, 0..snapshot.text.len()), 0);
     }
 
     #[gpui::test]
@@ -69,10 +67,7 @@ mod tests {
         let text = "fn helper(value: usize) -> usize {\n    let total = ;\n    if value > 0 {\n        value +\n    }\n}\n";
         let snapshot = rust_snapshot(text, cx);
 
-        assert_eq!(
-            ts_error_count_in_range(&snapshot, 0..snapshot.text.len()),
-            2
-        );
+        assert_eq!(error_count_in_range(&snapshot, 0..snapshot.text.len()), 2);
     }
 
     #[gpui::test]
@@ -82,7 +77,7 @@ mod tests {
         let body_start = text.find("let value").unwrap();
         let body_end = body_start + "let value = 1;".len();
 
-        assert_eq!(ts_error_count_in_range(&snapshot, body_start..body_end), 0);
+        assert_eq!(error_count_in_range(&snapshot, body_start..body_end), 0);
     }
 
     #[gpui::test]
@@ -92,9 +87,6 @@ mod tests {
         let error_start = text.find("let broken = ;").unwrap();
         let error_end = error_start + "let broken = ;".len();
 
-        assert_eq!(
-            ts_error_count_in_range(&snapshot, error_start..error_end),
-            1
-        );
+        assert_eq!(error_count_in_range(&snapshot, error_start..error_end), 1);
     }
 }

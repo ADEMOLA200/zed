@@ -480,10 +480,13 @@ impl std::ops::Deref for BufferEditPrediction<'_> {
 }
 
 #[derive(Clone)]
-
 struct PendingSettledPrediction {
     request_id: EditPredictionId,
     editable_anchor_range: Range<Anchor>,
+    editable_region_before_prediction: String,
+    predicted_editable_region: String,
+    ts_error_count_before_prediction: usize,
+    ts_error_count_after_prediction: usize,
     example: Option<ExampleSpec>,
     enqueued_at: Instant,
     last_edit_at: Instant,
@@ -1629,6 +1632,11 @@ impl EditPredictionStore {
                                             pending_prediction.editable_anchor_range.clone(),
                                         )
                                         .collect::<String>();
+                                    let kept_rate_result = compute_kept_rate(
+                                        &pending_prediction.editable_region_before_prediction,
+                                        &pending_prediction.predicted_editable_region,
+                                        &settled_editable_region,
+                                    );
 
                                     #[cfg(test)]
                                     if let Some(callback) = &this.settled_event_callback {
@@ -1641,7 +1649,17 @@ impl EditPredictionStore {
                                     telemetry::event!(
                                         EDIT_PREDICTION_SETTLED_EVENT,
                                         request_id = pending_prediction.request_id.0.clone(),
+                                        editable_region_before_prediction = pending_prediction
+                                            .editable_region_before_prediction
+                                            .clone(),
+                                        predicted_editable_region =
+                                            pending_prediction.predicted_editable_region.clone(),
                                         settled_editable_region,
+                                        kept_chars = kept_rate_result.kept_chars,
+                                        ts_error_count_before_prediction =
+                                            pending_prediction.ts_error_count_before_prediction,
+                                        ts_error_count_after_prediction =
+                                            pending_prediction.ts_error_count_after_prediction,
                                         example = pending_prediction.example.take(),
                                         e2e_latency = pending_prediction.e2e_latency.as_millis(),
                                     );
@@ -1672,6 +1690,10 @@ impl EditPredictionStore {
         edited_buffer: &Entity<Buffer>,
         edited_buffer_snapshot: &BufferSnapshot,
         editable_offset_range: Range<usize>,
+        editable_region_before_prediction: String,
+        predicted_editable_region: String,
+        ts_error_count_before_prediction: usize,
+        ts_error_count_after_prediction: usize,
         example: Option<ExampleSpec>,
         e2e_latency: std::time::Duration,
         cx: &mut Context<Self>,
@@ -1684,18 +1706,18 @@ impl EditPredictionStore {
         else {
             return;
         };
-        let ts_error_count_before = crate::metrics::ts_error_count_in_range(
-            &edited_buffer_snapshot,
-            editable_offset_range.clone(),
-        );
         let editable_anchor_range =
             edited_buffer_snapshot.anchor_range_inside(editable_offset_range);
         let now = cx.background_executor().now();
         registered_buffer
             .pending_predictions
             .push(PendingSettledPrediction {
-                request_id: request_id,
+                request_id,
                 editable_anchor_range,
+                editable_region_before_prediction,
+                predicted_editable_region,
+                ts_error_count_before_prediction,
+                ts_error_count_after_prediction,
                 example,
                 e2e_latency,
                 enqueued_at: now,

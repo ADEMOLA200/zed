@@ -139,7 +139,6 @@ use project::{ProjectPath, WorktreeId};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::VecDeque, sync::Arc};
 use ui::App;
-use util::ResultExt;
 use workspace::{
     Workspace,
     notifications::{NotificationId, simple_message_notification::MessageNotification},
@@ -179,7 +178,7 @@ impl Operation {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum Change {
     Created(ProjectPath),
     Trashed(WorktreeId, TrashedEntry),
@@ -251,7 +250,7 @@ impl UndoManager {
             can_redo: Arc::clone(&inner.can_redo),
         };
 
-        cx.spawn(async move |cx| inner.manage_undo_and_redo(cx.clone()))
+        cx.spawn(async move |cx| inner.manage_undo_and_redo(cx.clone()).await)
             .detach();
 
         this
@@ -284,22 +283,36 @@ impl UndoManager {
     }
 }
 
+#[derive(Debug)]
 enum UndoMessage {
     Changed(Vec<Change>),
     PlsUndo,
     PlsRedo,
 }
 
+impl UndoMessage {
+    fn title(&self) -> &'static str {
+        match self {
+            UndoMessage::Changed(_) => {
+                "this is a bug in the manage_undo_and_redo task please report"
+            }
+            UndoMessage::PlsUndo => "Undo failed",
+            UndoMessage::PlsRedo => "Redo failed",
+        }
+    }
+}
+
 impl Inner {
     async fn manage_undo_and_redo(mut self, mut cx: AsyncApp) {
         loop {
-            let Ok(new) = self.rx.recv().await else {
-                // project panel got closed?
+            let Ok(mut new) = dbg!(self.rx.recv().await) else {
+                // project panel got closed
+                dbg!("wtf the project panel did not get closed right?");
                 return;
             };
 
-            match new {
-                UndoMessage::Changed(changes) => Ok(self.record(changes)),
+            let res = match new {
+                UndoMessage::Changed(ref mut changes) => Ok(self.record(changes)),
                 UndoMessage::PlsUndo => {
                     let res = self.undo(&mut cx).await;
                     let _ = self.panel.update(&mut cx, |_, cx| cx.notify());
@@ -310,8 +323,11 @@ impl Inner {
                     let _ = self.panel.update(&mut cx, |_, cx| cx.notify());
                     res
                 }
+            };
+
+            if let Err(e) = res {
+                Self::show_error(new.title(), self.workspace.clone(), e.to_string(), &mut cx);
             }
-            .log_err();
 
             self.can_undo.store(self.can_undo(), Ordering::Relaxed);
             self.can_redo.store(self.can_redo(), Ordering::Relaxed);
@@ -423,8 +439,8 @@ impl Inner {
     }
 
     /// Passed in changes will always be performed as a single step
-    pub fn record(&mut self, changes: Vec<Change>) {
-        let mut changes = changes.into_iter();
+    pub fn record(&mut self, changes: &mut Vec<Change>) {
+        let mut changes = changes.drain(..);
         let Some(first) = changes.by_ref().next() else {
             return;
         };
@@ -521,8 +537,8 @@ impl Inner {
     fn show_error(
         title: impl Into<SharedString>,
         workspace: WeakEntity<Workspace>,
-        error: SharedString,
-        cx: &mut App,
+        error: String,
+        cx: &mut AsyncApp,
     ) {
         workspace
             .update(cx, move |workspace, cx| {
@@ -530,7 +546,7 @@ impl Inner {
                     NotificationId::Named(SharedString::new_static("project_panel_undo"));
 
                 workspace.show_notification(notification_id, cx, move |cx| {
-                    cx.new(|cx| MessageNotification::new(error.to_string(), cx).with_title(title))
+                    cx.new(|cx| MessageNotification::new(error, cx).with_title(title))
                 })
             })
             .ok();

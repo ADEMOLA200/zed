@@ -2412,10 +2412,10 @@ impl Thread {
         json_parse_error: String,
         event_stream: &ThreadEventStream,
     ) -> LanguageModelToolResult {
-        if let Some(running_turn) = self.running_turn.as_mut() {
-            if let Some(sender) = running_turn.streaming_tool_inputs.remove(&tool_use_id) {
-                drop(sender);
-            }
+        if let Some(running_turn) = self.running_turn.as_mut()
+            && let Some(sender) = running_turn.streaming_tool_inputs.remove(&tool_use_id)
+        {
+            drop(sender);
         }
 
         let tool_use = LanguageModelToolUse {

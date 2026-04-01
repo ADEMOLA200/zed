@@ -1,8 +1,7 @@
-use std::ops::Range;
 use std::sync::Arc;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use edit_prediction::metrics::ts_error_count_in_range;
+use edit_prediction::metrics::count_tree_sitter_errors;
 use fs::FakeFs;
 use gpui::{AppContext as _, TestAppContext};
 use language::{Buffer, BufferSnapshot, LanguageRegistry};
@@ -15,7 +14,6 @@ struct ParsedCase {
     bytes: usize,
     error_count: usize,
     snapshot: BufferSnapshot,
-    full_range: Range<usize>,
 }
 
 fn replace_nth_occurrences(
@@ -259,7 +257,7 @@ fn build_case(
 
     let snapshot = buffer.read_with(context, |buffer, _| buffer.snapshot());
     let full_range = 0..snapshot.text.len();
-    let error_count = ts_error_count_in_range(&snapshot, full_range.clone());
+    let error_count = count_tree_sitter_errors(snapshot.syntax_layers());
     if expect_errors {
         assert!(
             error_count > 0,
@@ -284,7 +282,6 @@ fn build_case(
         bytes: full_range.end,
         error_count,
         snapshot,
-        full_range,
     }
 }
 
@@ -444,10 +441,7 @@ fn ts_error_count_benchmark(c: &mut Criterion) {
                 bench.iter(|| {
                     black_box(case.bytes);
                     black_box(case.error_count);
-                    black_box(ts_error_count_in_range(
-                        black_box(&case.snapshot),
-                        black_box(case.full_range.clone()),
-                    ))
+                    black_box(count_tree_sitter_errors(case.snapshot.syntax_layers()))
                 });
             },
         );

@@ -405,25 +405,7 @@ pub fn request_prediction_with_zeta(
             let edited_buffer = edited_buffer.clone();
             let edited_buffer_snapshot = edited_buffer_snapshot.clone();
             let editable_range_in_buffer = editable_range_in_buffer.clone();
-            let editable_anchor_range =
-                edited_buffer_snapshot.anchor_range_around(editable_range_in_buffer.clone());
-            let editable_region_before_prediction = edited_buffer_snapshot
-                .text_for_range(editable_range_in_buffer.clone())
-                .collect::<String>();
-            let predicted_editable_region = prediction
-                .edit_preview
-                .text_for_range_in_result(editable_anchor_range.clone());
-            let ts_error_count_before_prediction = crate::metrics::count_tree_sitter_errors(
-                edited_buffer_snapshot.syntax_layers_for_range(editable_anchor_range.clone(), true),
-            );
-            let result_syntax_snapshot = prediction.edit_preview.result_syntax_snapshot();
-            let syntax_layers = result_syntax_snapshot.layers_for_range(
-                editable_anchor_range,
-                prediction.edit_preview.result_text_snapshot(),
-                true,
-            );
-            let ts_error_count_after_prediction =
-                crate::metrics::count_tree_sitter_errors(syntax_layers);
+            let edit_preview = prediction.edit_preview.clone();
             let example_task = capture_data.and_then(|stored_events| {
                 cx.update(|cx| {
                     crate::capture_example(
@@ -451,10 +433,7 @@ pub fn request_prediction_with_zeta(
                             &edited_buffer,
                             &edited_buffer_snapshot,
                             editable_range_in_buffer,
-                            editable_region_before_prediction,
-                            predicted_editable_region,
-                            ts_error_count_before_prediction,
-                            ts_error_count_after_prediction,
+                            &edit_preview,
                             example_spec,
                             request_duration,
                             cx,

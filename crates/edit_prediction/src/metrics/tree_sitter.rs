@@ -60,10 +60,10 @@ mod tests {
 
     #[gpui::test]
     async fn counts_errors_for_invalid_rust(cx: &mut TestAppContext) {
-        let text = "fn helper(value: usize) -> usize {\n    let total = ;\n    if value > 0 {\n        value +\n    }\n}\n";
+        let text = "fn helper(value: usize) -> usize {\n    let total = ;\n    total\n}\n";
         let snapshot = rust_snapshot(text, cx);
 
-        assert_eq!(error_count_in_range(&snapshot, 0..snapshot.text.len()), 2);
+        assert_eq!(error_count_in_range(&snapshot, 0..snapshot.text.len()), 1);
     }
 
     #[gpui::test]

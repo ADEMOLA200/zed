@@ -29,7 +29,7 @@ use gpui::{
 };
 use heapless::Vec as ArrayVec;
 use language::language_settings::all_language_settings;
-use language::{Anchor, Buffer, File, Point, TextBufferSnapshot, ToOffset, ToPoint};
+use language::{Anchor, Buffer, EditPreview, File, Point, TextBufferSnapshot, ToOffset, ToPoint};
 use language::{BufferSnapshot, OffsetRangeExt};
 use language_model::LlmApiToken;
 use project::{DisableAiSettings, Project, ProjectPath, WorktreeId};
@@ -1690,10 +1690,7 @@ impl EditPredictionStore {
         edited_buffer: &Entity<Buffer>,
         edited_buffer_snapshot: &BufferSnapshot,
         editable_offset_range: Range<usize>,
-        editable_region_before_prediction: String,
-        predicted_editable_region: String,
-        ts_error_count_before_prediction: usize,
-        ts_error_count_after_prediction: usize,
+        edit_preview: &EditPreview,
         example: Option<ExampleSpec>,
         e2e_latency: std::time::Duration,
         cx: &mut Context<Self>,
@@ -1706,6 +1703,24 @@ impl EditPredictionStore {
         else {
             return;
         };
+        let editable_region_before_prediction = edited_buffer_snapshot
+            .text_for_range(editable_offset_range.clone())
+            .collect::<String>();
+        let editable_anchor_range_for_result =
+            edited_buffer_snapshot.anchor_range_inside(editable_offset_range.clone());
+        let predicted_editable_region =
+            edit_preview.text_for_range_in_result(editable_anchor_range_for_result.clone());
+        let ts_error_count_before_prediction = crate::metrics::count_tree_sitter_errors(
+            edited_buffer_snapshot
+                .syntax_layers_for_range(editable_anchor_range_for_result.clone(), true),
+        );
+        let ts_error_count_after_prediction = crate::metrics::count_tree_sitter_errors(
+            edit_preview.result_syntax_snapshot().layers_for_range(
+                editable_anchor_range_for_result,
+                edit_preview.result_text_snapshot(),
+                true,
+            ),
+        );
         let editable_anchor_range =
             edited_buffer_snapshot.anchor_range_inside(editable_offset_range);
         let now = cx.background_executor().now();

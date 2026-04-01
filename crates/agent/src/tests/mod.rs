@@ -3902,6 +3902,125 @@ async fn test_streaming_tool_completes_when_llm_stream_ends_without_final_input(
     });
 }
 
+#[gpui::test]
+async fn test_streaming_tool_json_parse_error_finalizes_sender(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    thread.update(cx, |thread, _cx| {
+        thread.add_tool(StreamingEchoTool::new());
+    });
+
+    let _events = thread
+        .update(cx, |thread, cx| {
+            thread.send(UserMessageId::new(), ["Use the streaming_echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Send a partial tool use (is_input_complete = false), simulating the LLM
+    // streaming input for a tool. This creates a ToolInputSender in
+    // streaming_tool_inputs and starts the tool.
+    let tool_use = LanguageModelToolUse {
+        id: "tool_1".into(),
+        name: "streaming_echo".into(),
+        raw_input: r#"{"text": "partial"#.into(),
+        input: json!({"text": "partial"}),
+        is_input_complete: false,
+        thought_signature: None,
+    };
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use.clone()));
+    cx.run_until_parked();
+
+    // Now emit a ToolUseJsonParseError for the SAME tool_use id. This
+    // simulates the LLM streaming malformed JSON that fails to parse at
+    // ContentBlockStop. The bug: handle_tool_use_json_parse_error_event does
+    // NOT finalize the ToolInputSender, leaving it orphaned in
+    // streaming_tool_inputs. The already-running tool then hangs on
+    // recv()/recv_partial() until the stream-end drain drops the sender.
+    fake_model.send_last_completion_stream_event(
+        LanguageModelCompletionEvent::ToolUseJsonParseError {
+            id: "tool_1".into(),
+            tool_name: "streaming_echo".into(),
+            raw_input: r#"{"text": "partial"#.into(),
+            json_parse_error: "EOF while parsing a string at line 1 column 17".into(),
+        },
+    );
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::ToolUse));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Advance past the retry delay so run_turn_internal retries.
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+
+    // The retry request should contain exactly ONE error result for the tool:
+    // the JSON parse error. With the bug, we get TWO error results: the JSON
+    // parse error from handle_tool_use_json_parse_error_event AND a "tool
+    // input was not fully received" error from the orphaned streaming tool.
+    let completion = fake_model
+        .pending_completions()
+        .pop()
+        .expect("No running turn");
+
+    let tool_results: Vec<_> = completion
+        .messages
+        .iter()
+        .flat_map(|msg| &msg.content)
+        .filter_map(|content| match content {
+            language_model::MessageContent::ToolResult(result)
+                if result.tool_use_id == language_model::LanguageModelToolUseId::from("tool_1") =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
+        .collect();
+
+    // There should be exactly one tool result for this tool_use_id.
+    assert_eq!(
+        tool_results.len(),
+        1,
+        "Expected exactly 1 tool result for tool_1, got {}: {:#?}",
+        tool_results.len(),
+        tool_results
+    );
+
+    // The single result should be the JSON parse error, not the orphaned
+    // sender's "tool input was not fully received".
+    let result = tool_results[0];
+    assert!(result.is_error);
+    let content_text = match &result.content {
+        language_model::LanguageModelToolResultContent::Text(t) => t.to_string(),
+        other => panic!("Expected text content, got {:?}", other),
+    };
+    assert!(
+        content_text.contains("Error parsing input JSON"),
+        "Expected JSON parse error message, got: {content_text}"
+    );
+    assert!(
+        !content_text.contains("tool input was not fully received"),
+        "Should not contain orphaned sender error, got: {content_text}"
+    );
+
+    // Finish the retry round so the turn completes cleanly.
+    fake_model.send_last_completion_stream_text_chunk("Done");
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _cx| {
+        assert!(
+            thread.is_turn_complete(),
+            "Thread should not be stuck; the turn should have completed",
+        );
+    });
+}
+
 /// Filters out the stop events for asserting against in tests
 fn stop_events(result_events: Vec<Result<ThreadEvent>>) -> Vec<acp::StopReason> {
     result_events

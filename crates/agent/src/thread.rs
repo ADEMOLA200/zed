@@ -2095,7 +2095,8 @@ impl Thread {
         this.update(cx, |this, _cx| {
             this.pending_message()
                 .tool_results
-                .insert(tool_result.tool_use_id.clone(), tool_result);
+                .entry(tool_result.tool_use_id.clone())
+                .or_insert(tool_result);
         })?;
         Ok(())
     }
@@ -2411,6 +2412,12 @@ impl Thread {
         json_parse_error: String,
         event_stream: &ThreadEventStream,
     ) -> LanguageModelToolResult {
+        if let Some(running_turn) = self.running_turn.as_mut() {
+            if let Some(sender) = running_turn.streaming_tool_inputs.remove(&tool_use_id) {
+                drop(sender);
+            }
+        }
+
         let tool_use = LanguageModelToolUse {
             id: tool_use_id.clone(),
             name: tool_name.clone(),

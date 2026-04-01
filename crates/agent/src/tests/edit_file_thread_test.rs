@@ -202,3 +202,226 @@ async fn test_edit_file_tool_in_thread_context(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// Reproduces the cascade described in the eval report:
+///
+/// 1. The LLM streams partial edit_file JSON that starts modifying the buffer.
+/// 2. At ContentBlockStop, the accumulated JSON is malformed → ToolUseJsonParseError.
+/// 3. handle_tool_use_json_parse_error_event does NOT finalize the ToolInputSender.
+/// 4. The orphaned sender is drained at stream-end; the tool errors with
+///    "tool input was not fully received".
+/// 5. The buffer was partially written during streaming and is now **dirty**.
+/// 6. On retry, the model sends a fresh edit_file call for the same file.
+/// 7. ensure_buffer_saved detects the dirty buffer → "unsaved changes" error.
+///
+/// This test verifies step 7: the retry's tool result reports the unsaved
+/// changes error, proving the cascade from the orphaned sender.
+#[gpui::test]
+async fn test_streaming_edit_json_parse_error_cascades_to_unsaved_changes(cx: &mut TestAppContext) {
+    super::init_test(cx);
+    super::always_allow_tools(cx);
+
+    // Enable the streaming edit file tool feature flag.
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["streaming-edit-file-tool".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "src": {
+                "main.rs": "fn main() {\n    println!(\"Hello, world!\");\n}\n"
+            }
+        }),
+    )
+    .await;
+
+    let project = project::Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| crate::ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = Arc::new(FakeLanguageModel::default());
+    model.as_fake().set_supports_streaming_tools(true);
+    let fake_model = model.as_fake();
+
+    let thread = cx.new(|cx| {
+        let mut thread = crate::Thread::new(
+            project.clone(),
+            project_context,
+            context_server_registry,
+            crate::Templates::new(),
+            Some(model.clone()),
+            cx,
+        );
+        let language_registry = project.read(cx).languages().clone();
+        thread.add_tool(crate::StreamingEditFileTool::new(
+            project.clone(),
+            cx.weak_entity(),
+            thread.action_log().clone(),
+            language_registry,
+        ));
+        thread
+    });
+
+    // ── Turn 1: trigger the bug ──────────────────────────────────────────
+    let _events = thread
+        .update(cx, |thread, cx| {
+            thread.send(
+                UserMessageId::new(),
+                ["Write new content to src/main.rs"],
+                cx,
+            )
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // First partial: path + description + mode (not yet enough to create
+    // the EditSession because path_complete requires the path to match
+    // the previous partial).
+    let tool_use_id = "edit_1";
+    let partial_1 = LanguageModelToolUse {
+        id: tool_use_id.into(),
+        name: EditFileTool::NAME.into(),
+        raw_input: json!({
+            "display_description": "Rewrite main.rs",
+            "path": "project/src/main.rs",
+            "mode": "write"
+        })
+        .to_string(),
+        input: json!({
+            "display_description": "Rewrite main.rs",
+            "path": "project/src/main.rs",
+            "mode": "write"
+        }),
+        is_input_complete: false,
+        thought_signature: None,
+    };
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(partial_1));
+    cx.run_until_parked();
+
+    // Second partial: same path again (path_complete = true) + content.
+    // This creates the EditSession and writes to the buffer, making it dirty.
+    let partial_2 = LanguageModelToolUse {
+        id: tool_use_id.into(),
+        name: EditFileTool::NAME.into(),
+        raw_input: json!({
+            "display_description": "Rewrite main.rs",
+            "path": "project/src/main.rs",
+            "mode": "write",
+            "content": "fn main() { /* rewritten */ }"
+        })
+        .to_string(),
+        input: json!({
+            "display_description": "Rewrite main.rs",
+            "path": "project/src/main.rs",
+            "mode": "write",
+            "content": "fn main() { /* rewritten */ }"
+        }),
+        is_input_complete: false,
+        thought_signature: None,
+    };
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(partial_2));
+    cx.run_until_parked();
+
+    // Emit ToolUseJsonParseError for the SAME tool_use_id.
+    // In production this happens when ContentBlockStop finds the accumulated
+    // JSON is malformed (e.g. unescaped characters).
+    fake_model.send_last_completion_stream_event(
+        LanguageModelCompletionEvent::ToolUseJsonParseError {
+            id: tool_use_id.into(),
+            tool_name: EditFileTool::NAME.into(),
+            raw_input: r#"{"display_description":"Rewrite main.rs","path":"project/src/main.rs","mode":"write","content":"fn main() { /* rewritten "#.into(),
+            json_parse_error: "EOF while parsing a string at line 1 column 95".into(),
+        },
+    );
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::ToolUse));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Advance past the retry delay so the thread retries.
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+
+    // ── Turn 2 (retry): model sends a fresh, complete edit_file call ─────
+    // The thread should have retried and be waiting for a new completion.
+    assert!(
+        !fake_model.pending_completions().is_empty(),
+        "Thread should have retried after the error"
+    );
+
+    // Respond with a new, well-formed, complete edit_file tool use.
+    let retry_tool_use = LanguageModelToolUse {
+        id: "edit_2".into(),
+        name: EditFileTool::NAME.into(),
+        raw_input: json!({
+            "display_description": "Rewrite main.rs",
+            "path": "project/src/main.rs",
+            "mode": "write",
+            "content": "fn main() {\n    println!(\"Hello, rewritten!\");\n}\n"
+        })
+        .to_string(),
+        input: json!({
+            "display_description": "Rewrite main.rs",
+            "path": "project/src/main.rs",
+            "mode": "write",
+            "content": "fn main() {\n    println!(\"Hello, rewritten!\");\n}\n"
+        }),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(retry_tool_use));
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::ToolUse));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Advance clock again in case there's another retry delay.
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+
+    // ── Verify the cascade ──────────────────────────────────────────────
+    // The thread should have retried again. Find the tool result for edit_2.
+    let completion = fake_model
+        .pending_completions()
+        .pop()
+        .expect("Thread should have retried after the unsaved changes error");
+
+    let tool_result = completion
+        .messages
+        .iter()
+        .flat_map(|msg| &msg.content)
+        .find_map(|content| match content {
+            language_model::MessageContent::ToolResult(result)
+                if result.tool_use_id == language_model::LanguageModelToolUseId::from("edit_2") =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("Should have a tool result for edit_2");
+
+    // The tool result should be an error about unsaved changes —
+    // the cascade from the orphaned sender leaving the buffer dirty.
+    assert!(
+        tool_result.is_error,
+        "Tool result should be an error, got: {:?}",
+        tool_result
+    );
+    let content_text = match &tool_result.content {
+        language_model::LanguageModelToolResultContent::Text(t) => t.to_string(),
+        other => panic!("Expected text content, got: {:?}", other),
+    };
+    assert!(
+        content_text.contains("unsaved changes"),
+        "Expected 'unsaved changes' error from ensure_buffer_saved, got: {content_text}"
+    );
+
+    // Clean up: complete the turn.
+    fake_model.send_last_completion_stream_text_chunk("I see the file has unsaved changes.");
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+}

@@ -66,7 +66,6 @@ use ui::{
     ListItem, ListItemSpacing, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip,
     WithScrollbar, prelude::*, v_flex,
 };
-use futures::lock::Mutex;
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt, maybe,
     paths::{PathStyle, compare_paths},
@@ -162,7 +161,7 @@ pub struct ProjectPanel {
     sticky_items_count: usize,
     last_reported_update: Instant,
     update_visible_entries_task: UpdateVisibleEntriesTask,
-    undo_manager: Arc<Mutex<UndoManager>>,
+    undo_manager: UndoManager,
     state: State,
 }
 
@@ -904,8 +903,7 @@ impl ProjectPanel {
                     unfolded_dir_ids: Default::default(),
                 },
                 update_visible_entries_task: Default::default(),
-                undo_manager: Arc::new(Mutex::new(
-                    UndoManager::new(workspace.weak_handle(), weak_project_panel))),
+                undo_manager: UndoManager::new(workspace.weak_handle(), weak_project_panel, &cx),
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -1244,12 +1242,12 @@ impl ProjectPanel {
                             .action_disabled_when(!has_pasteable_content, "Paste", Box::new(Paste))
                             .when(cx.has_flag::<ProjectPanelUndoRedoFeatureFlag>(), |menu| {
                                 menu.action_disabled_when(
-                                    !self.undo_manager.read(cx).can_undo(),
+                                    !self.undo_manager.can_undo(),
                                     "Undo",
                                     Box::new(Undo),
                                 )
                                 .action_disabled_when(
-                                    !self.undo_manager.read(cx).can_redo(),
+                                    !self.undo_manager.can_redo(),
                                     "Redo",
                                     Box::new(Redo),
                                 )
@@ -1945,21 +1943,22 @@ impl ProjectPanel {
 
         Some(cx.spawn_in(window, async move |project_panel, cx| {
             let new_entry = edit_task.await;
-            let undo_manager = project_panel.update(cx, |project_panel, cx| {
+            project_panel.update(cx, |project_panel, cx| {
                 project_panel.state.edit_state = None;
-                cx.notify();
-                project_panel.undo_manager.clone()
-            })?;
 
-            if new_entry.is_ok() {
-                let operation = if let Some(old_entry) = edited_entry {
-                    Change::Renamed((worktree_id, old_entry.path).into(), new_project_path)
-                } else {
-                    Change::Created(new_project_path)
-                };
-                 // TODO(yara) how fast are undo's happening? is it okay to wait for the mutex here? what if an trash/untrash is taking
-                undo_manager.lock().await.record([operation]);
-            }
+                // Record the operation if the edit was applied
+                if new_entry.is_ok() {
+                    let operation = if let Some(old_entry) = edited_entry {
+                        Change::Renamed((worktree_id, old_entry.path).into(), new_project_path)
+                    } else {
+                        Change::Created(new_project_path)
+                    };
+
+                    project_panel.undo_manager.record([operation]);
+                }
+
+                cx.notify();
+            })?;
 
             match new_entry {
                 Err(e) => {
@@ -2208,27 +2207,12 @@ impl ProjectPanel {
         }
     }
 
-    pub fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn(|_, cx| async {
-            // Undo manager needs to do a lot of mutation on self at various
-            // layers in its _async_ callstack. If it where a gpui entity that
-            // would get quiet annoying since we can not hold a borrow on Self
-            // across await points (if self is coming from the Context).
-            //
-            // Instead of putting undo manager into gpui we put it on the heap
-            // in an Arc<Mutex>>. So we lock that mutex here and get an
-            // reference to an owned Self that can be passed through the entire
-            // async callstack.
-            let manager = self.undo_manager.lock().await();
-            manager.undo().await;
-        })
-        .detach_and_log_err(cx);
-        cx.notify();
+    pub fn undo(&mut self, _: &Undo, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.undo_manager.undo();
     }
 
-    pub fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
-        self.undo_manager.redo(cx);
-        cx.notify();
+    pub fn redo(&mut self, _: &Redo, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.undo_manager.redo();
     }
 
     fn rename_impl(
@@ -4538,25 +4522,21 @@ impl ProjectPanel {
                     }
                     // update selection
                     if let Some(entry_id) = last_succeed {
+                        project_panel.update_in(cx, |project_panel, window, cx| {
+                            project_panel.selection = Some(SelectedEntry {
+                                worktree_id,
+                                entry_id,
+                            });
+                            // if only one entry was dragged and it was disambiguated, open the rename editor
+                            if item_count == 1 && disambiguation_range.is_some() {
+                                project_panel.rename_impl(disambiguation_range, window, cx);
+                            }
 
-                        let undo_manager = project_panel.read_with(cx, |panel, cx| panel.undo_manager.clone())?;
-                        undo_manager.lock().await.record(changes);
-
-                        project_panel
-                            .update_in(cx, |project_panel, window, cx| {
-                                project_panel.selection = Some(SelectedEntry {
-                                    worktree_id,
-                                    entry_id,
-                                });
-                                // if only one entry was dragged and it was disambiguated, open the rename editor
-                                if item_count == 1 && disambiguation_range.is_some() {
-                                    project_panel.rename_impl(disambiguation_range, window, cx);
-                                }
-                            })
-                            .ok();
+                            project_panel.undo_manager.record(changes)
+                        })??;
                     }
 
-                    Ok(())
+                    std::result::Result::Ok::<(), anyhow::Error>(())
                 })
                 .detach();
                 Some(())

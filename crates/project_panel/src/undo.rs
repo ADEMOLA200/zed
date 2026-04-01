@@ -101,8 +101,7 @@
 //! 	2 Restored(ProjectPath)
 //!     2 +++cursor+++
 
-
-//! 
+//!
 //! create A;                                                      A
 //! rename A -> B;                                                 B
 //! undo (rename B -> A)       (takes 10s for some reason)         B (still b cause it's hanging for 10s)
@@ -112,34 +111,35 @@
 //! undo manger renames (does not hang)                            A
 //! remove A                                                       _
 //! user sad
- 
-//! 
+
+//!
 //! create A;                                                      A
 //! rename A -> B;                                                 B
 //! undo (rename B -> A)       (takes 10s for some reason)         B (still b cause it's hanging for 10s)
 //! create C                                                       B
 //! -- src/c.rs
-//!    -- 
+//!    --
 
-//! 
+//!
 //! create docs/files/ directory                                   docs/files/
 //! create docs/files/a.txt                                        docs/files/
 //! undo (rename B -> A)       (takes 10s for some reason)         B (still b cause it's hanging for 10s)
 //! create C                                                       B
 //! -- src/c.rs
-//!    -- 
-
+//!    --
 
 //! List of "tainted files" that the user may not operate on
 
 use crate::ProjectPanel;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use fs::TrashedEntry;
+use futures::channel::mpsc;
 use gpui::{AppContext, AsyncApp, SharedString, Task, WeakEntity};
 use project::{ProjectPath, WorktreeId};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::VecDeque, sync::Arc};
 use ui::App;
+use util::ResultExt;
 use workspace::{
     Workspace,
     notifications::{NotificationId, simple_message_notification::MessageNotification},
@@ -155,7 +155,7 @@ enum Operation {
 }
 
 impl Operation {
-    async fn execute(self, undo_manager: &UndoManager, cx: &mut AsyncApp) -> Result<Change> {
+    async fn execute(self, undo_manager: &Inner, cx: &mut AsyncApp) -> Result<Change> {
         Ok(match self {
             Operation::Create(project_path) => {
                 undo_manager.create(&project_path, cx).await?;
@@ -228,40 +228,125 @@ struct Inner {
     cursor: usize,
     /// Maximum number of operations to keep on the undo history.
     limit: usize,
+    can_undo: Arc<AtomicBool>,
+    can_redo: Arc<AtomicBool>,
+    rx: mpsc::Receiver<UndoMessage>,
 }
 
 /// pls arc this
 #[derive(Clone)]
 pub struct UndoManager {
-    pending_recordings: Arc<Mutex<Vec<Change>>>,
-    inner: Arc<futures::lock::Mutex<Inner>>,
-}
-
-enum CanRedo {
-    Yes,
-    No,
-    NotNow,
+    tx: mpsc::Sender<UndoMessage>,
+    can_undo: Arc<AtomicBool>,
+    can_redo: Arc<AtomicBool>,
 }
 
 impl UndoManager {
-    pub fn new(workspace: WeakEntity<Workspace>, panel: WeakEntity<ProjectPanel>) -> Self {
-        Self::new_with_limit(workspace, panel, MAX_UNDO_OPERATIONS)
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        panel: WeakEntity<ProjectPanel>,
+        cx: &App,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel(1024);
+        let inner = Inner::new(workspace, panel, rx);
+
+        let this = Self {
+            tx,
+            can_undo: Arc::clone(&inner.can_undo),
+            can_redo: Arc::clone(&inner.can_redo),
+        };
+
+        inner.manage_undo_and_redo(cx.to_async());
+
+        this
+    }
+
+    pub fn undo(&mut self) -> Result<()> {
+        self.tx
+            .try_send(UndoMessage::PlsUndo)
+            .context("Undo and redo task can not keep up")
+    }
+    pub fn redo(&mut self) -> Result<()> {
+        self.tx
+            .try_send(UndoMessage::PlsRedo)
+            .context("Undo and redo task can not keep up")
+    }
+    pub fn record(&mut self, changes: impl IntoIterator<Item = Change>) -> Result<()> {
+        self.tx
+            .try_send(UndoMessage::Changed(changes.into_iter().collect()))
+            .context("Undo and redo task can not keep up")
+    }
+    /// just for the UI, an undo may still fail if there are concurrent file
+    /// operations happening.
+    pub fn can_undo(&self) -> bool {
+        self.can_undo.load(Ordering::Relaxed)
+    }
+    /// just for the UI, an undo may still fail if there are concurrent file
+    /// operations happening.
+    pub fn can_redo(&self) -> bool {
+        self.can_redo.load(Ordering::Relaxed)
+    }
+}
+
+enum UndoMessage {
+    Changed(Vec<Change>),
+    PlsUndo,
+    PlsRedo,
+}
+
+impl Inner {
+    async fn manage_undo_and_redo(mut self, mut cx: AsyncApp) {
+        loop {
+            let Ok(new) = self.rx.recv().await else {
+                // project panel got closed?
+                return;
+            };
+
+            match new {
+                UndoMessage::Changed(changes) => Ok(self.record(changes)),
+                UndoMessage::PlsUndo => {
+                    let res = self.undo(&mut cx).await;
+                    self.panel.update(&mut cx, |_, cx| cx.notify());
+                    res
+                }
+                UndoMessage::PlsRedo => {
+                    let res = self.redo(&mut cx).await;
+                    self.panel.update(&mut cx, |_, cx| cx.notify());
+                    res
+                }
+            }
+            .log_err();
+
+            self.can_undo.store(self.can_undo(), Ordering::Relaxed);
+            self.can_redo.store(self.can_redo(), Ordering::Relaxed);
+        }
+    }
+}
+
+impl Inner {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        panel: WeakEntity<ProjectPanel>,
+        rx: mpsc::Receiver<UndoMessage>,
+    ) -> Self {
+        Self::new_with_limit(workspace, panel, MAX_UNDO_OPERATIONS, rx)
     }
 
     pub fn new_with_limit(
         workspace: WeakEntity<Workspace>,
         panel: WeakEntity<ProjectPanel>,
         limit: usize,
+        rx: mpsc::Receiver<UndoMessage>,
     ) -> Self {
         Self {
-            inner: Mutex::new(Inner {
-                workspace,
-                panel,
-                history: VecDeque::new(),
-                cursor: 0usize,
-                limit,
-            }),
-            pending_recordings: Arc::new(Mutex::new(Vec::new())),
+            workspace,
+            panel,
+            history: VecDeque::new(),
+            cursor: 0usize,
+            limit,
+            can_undo: Arc::new(AtomicBool::new(false)),
+            can_redo: Arc::new(AtomicBool::new(false)),
+            rx,
         }
     }
 
@@ -269,12 +354,8 @@ impl UndoManager {
         self.cursor > 0
     }
 
-    pub fn can_redo(&self) -> CanRedo {
-        let Some(inner) = self.inner.try_lock() else { // TODO pending recs process (somekind of self.state() that does that first)
-            return CanRedo::NotNow;
-        }
-        
-        inner.cursor < inner.history.len()
+    pub fn can_redo(&self) -> bool {
+        self.cursor < self.history.len()
     }
 
     pub async fn undo(&mut self, cx: &mut AsyncApp) -> Result<()> {
@@ -329,7 +410,7 @@ impl UndoManager {
         Ok(())
     }
 
-    pub async fn redo(&mut self, cx: &mut App) -> Result<()> {
+    pub async fn redo(&mut self, cx: &mut AsyncApp) -> Result<()> {
         if !self.can_redo() {
             return Ok(());
         }
@@ -339,23 +420,15 @@ impl UndoManager {
             .remove(self.cursor)
             .expect("we can redo")
             .clone();
-        let redo_change = change_at_the_cursor
-            .to_inverse()
-            .execute(self, &mut cx.to_async())
-            .await?;
+        let redo_change = change_at_the_cursor.to_inverse().execute(self, cx).await?;
         self.history.insert(self.cursor, redo_change);
         self.cursor += 1;
         Ok(())
     }
 
-    pub fn record(&self, changes: impl IntoIterator<Item = Change>) {
-        let mut pending_recs = self.pending_recordings.lock().unwrap();
-        pending_recs.extend(changes);
-    }
-
     /// Passed in changes will always be performed as a single step
-    pub fn process_recordings(&mut self) {
-        let mut changes = std::mem::take(&mut *self.pending_recordings.lock().unwrap()).into_iter();
+    pub fn record(&mut self, changes: Vec<Change>) {
+        let mut changes = changes.into_iter();
         let Some(first) = changes.by_ref().next() else {
             return;
         };

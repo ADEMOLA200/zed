@@ -38,3 +38,63 @@ pub fn ts_error_count_in_range(
         })
         .sum()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ts_error_count_in_range;
+    use gpui::{AppContext as _, TestAppContext};
+    use language::{Buffer, BufferSnapshot, rust_lang};
+
+    fn rust_snapshot(text: &str, cx: &mut TestAppContext) -> BufferSnapshot {
+        let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(rust_lang(), cx));
+        while buffer.read_with(cx, |buffer, _| buffer.is_parsing()) {
+            cx.run_until_parked();
+        }
+        buffer.read_with(cx, |buffer, _| buffer.snapshot())
+    }
+
+    #[gpui::test]
+    async fn counts_no_errors_for_valid_rust(cx: &mut TestAppContext) {
+        let text = "fn helper(value: usize) -> usize {\n    value + 1\n}\n";
+        let snapshot = rust_snapshot(text, cx);
+
+        assert_eq!(
+            ts_error_count_in_range(&snapshot, 0..snapshot.text.len()),
+            0
+        );
+    }
+
+    #[gpui::test]
+    async fn counts_errors_for_invalid_rust(cx: &mut TestAppContext) {
+        let text = "fn helper(value: usize) -> usize {\n    let total = ;\n    if value > 0 {\n        value +\n    }\n}\n";
+        let snapshot = rust_snapshot(text, cx);
+
+        assert_eq!(
+            ts_error_count_in_range(&snapshot, 0..snapshot.text.len()),
+            2
+        );
+    }
+
+    #[gpui::test]
+    async fn counts_no_errors_for_subrange_of_valid_rust(cx: &mut TestAppContext) {
+        let text = "fn first() -> usize {\n    let value = 1;\n    value + 1\n}\n";
+        let snapshot = rust_snapshot(text, cx);
+        let body_start = text.find("let value").unwrap();
+        let body_end = body_start + "let value = 1;".len();
+
+        assert_eq!(ts_error_count_in_range(&snapshot, body_start..body_end), 0);
+    }
+
+    #[gpui::test]
+    async fn counts_errors_for_subrange_of_invalid_rust(cx: &mut TestAppContext) {
+        let text = "fn second() -> usize {\n    let broken = ;\n    broken\n}\n";
+        let snapshot = rust_snapshot(text, cx);
+        let error_start = text.find("let broken = ;").unwrap();
+        let error_end = error_start + "let broken = ;".len();
+
+        assert_eq!(
+            ts_error_count_in_range(&snapshot, error_start..error_end),
+            1
+        );
+    }
+}

@@ -13,7 +13,8 @@ use crate::tasks::compliance::{
     report::Report,
 };
 
-const ZED_ZIPPY_COMMENT_APPROVAL_PATTERN: &str = "@zed-zippy approved";
+const ZED_ZIPPY_COMMENT_APPROVAL_PATTERN: &str = "@zed-zippy approve";
+const ZED_ZIPPY_GROUP_APPROVAL: &str = "@zed-industries/approved";
 
 #[derive(Debug)]
 pub(crate) enum ReviewSuccess {
@@ -245,14 +246,13 @@ impl Reporter {
             let mut org_approving_comments = Vec::new();
 
             for comment in other_comments {
-                if comment
-                    .body
-                    .as_ref()
-                    .is_some_and(|body| body.contains(ZED_ZIPPY_COMMENT_APPROVAL_PATTERN))
-                    && self
-                        .github_client
-                        .check_org_membership(&GithubLogin::new(comment.user.login.clone()))
-                        .await?
+                if comment.body.as_ref().is_some_and(|body| {
+                    body.contains(ZED_ZIPPY_COMMENT_APPROVAL_PATTERN)
+                        || body.contains(ZED_ZIPPY_GROUP_APPROVAL)
+                }) && self
+                    .github_client
+                    .check_org_membership(&GithubLogin::new(comment.user.login.clone()))
+                    .await?
                 {
                     org_approving_comments.push(comment);
                 }

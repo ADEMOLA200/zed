@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::tasks::compliance::ReleaseChannel;
 
 pub(crate) trait Subcommand {
-    type ParsedOutput: FromStr;
+    type ParsedOutput: FromStr<Err = anyhow::Error>;
 
     fn args(&self) -> impl IntoIterator<Item = String>;
 }
@@ -46,7 +46,7 @@ impl<G: Subcommand> GitCommand<G> {
                 .map_err(|_| anyhow!("Invalid UTF8"))
                 .and_then(|s| {
                     G::ParsedOutput::from_str(s.trim())
-                        .map_err(|_| anyhow!("Failed to parse from string"))
+                        .map_err(|e| anyhow!("Failed to parse from string: {e:?}"))
                 })
         } else {
             anyhow::bail!(
@@ -58,31 +58,48 @@ impl<G: Subcommand> GitCommand<G> {
     }
 }
 
-#[derive(Deref, Debug, Clone)]
-pub(crate) struct VersionTag(pub(crate) String);
+#[derive(Debug, Clone)]
+pub(crate) struct VersionTag(Version, ReleaseChannel);
 
 impl VersionTag {
-    pub(crate) fn new(version: &Version, channel: ReleaseChannel) -> Self {
-        VersionTag(format!(
+    pub fn parse(input: &str) -> Result<Self, anyhow::Error> {
+        // Being a bit more lenient for human inputs
+        let version = input.strip_prefix('v').unwrap_or(input);
+
+        let (version_str, channel) = version
+            .strip_suffix("-pre")
+            .map_or((version, ReleaseChannel::Stable), |version_str| {
+                (version_str, ReleaseChannel::Preview)
+            });
+
+        Version::parse(version_str)
+            .map(|version| Self(version, channel))
+            .map_err(|_| anyhow::anyhow!("Failed to parse version from tag!"))
+    }
+
+    pub(crate) fn version(&self) -> &Version {
+        &self.0
+    }
+}
+
+impl ToString for VersionTag {
+    fn to_string(&self) -> String {
+        format!(
             "v{version}{channel_suffix}",
-            version = version,
-            channel_suffix = channel.tag_suffix()
-        ))
+            version = self.0,
+            channel_suffix = self.1.tag_suffix()
+        )
     }
 }
 
 #[derive(Debug, Deref, FromStr, PartialEq, Eq, Hash, Deserialize)]
 pub(crate) struct CommitSha(pub(crate) String);
 
-// pub(crate) struct CommitForTag(pub(crate) VersionTag);
-
-// impl Subcommand for CommitForTag {
-//     type ParsedOutput = CommitSha;
-
-//     fn args(&self) -> impl IntoIterator<Item = String> {
-//         ["rev-list", "-n", "1", self.0.as_ref()].map(ToOwned::to_owned)
-//     }
-// }
+impl CommitSha {
+    pub(crate) fn short(&self) -> &str {
+        self.0.as_str().split_at(8).0
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct CommitDetails {
@@ -214,6 +231,51 @@ impl FromStr for CommitList {
     }
 }
 
+pub(crate) struct GetVersionTags;
+
+impl Subcommand for GetVersionTags {
+    type ParsedOutput = VersionTagList;
+
+    fn args(&self) -> impl IntoIterator<Item = String> {
+        ["tag", "-l", "v*"].map(ToOwned::to_owned)
+    }
+}
+
+pub(crate) struct VersionTagList(Vec<VersionTag>);
+
+impl VersionTagList {
+    pub(crate) fn sorted(mut self) -> Self {
+        self.0.sort_by(|a, b| a.version().cmp(b.version()));
+        self
+    }
+
+    pub(crate) fn find_previous_version(&self, version_tag: &VersionTag) -> Option<&VersionTag> {
+        self.0
+            .iter()
+            .take_while(|tag| tag.version() < version_tag.version())
+            .last()
+            .or_else(|| {
+                self.0
+                    .last()
+                    .filter(|tag| tag.version() < version_tag.version())
+            })
+    }
+}
+
+impl FromStr for VersionTagList {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let version_tags = s.lines().flat_map(VersionTag::parse).collect_vec();
+
+        version_tags
+            .is_empty()
+            .not()
+            .then_some(Self(version_tags))
+            .ok_or_else(|| anyhow::anyhow!("No version tags found"))
+    }
+}
+
 pub(crate) struct CommitsFromVersionToHead(pub(crate) VersionTag);
 
 impl Subcommand for CommitsFromVersionToHead {
@@ -223,7 +285,7 @@ impl Subcommand for CommitsFromVersionToHead {
         [
             "log".to_string(),
             format!("--pretty=format:{}", CommitDetails::FORMAT_STRING),
-            format!("{}..HEAD", self.0.as_str()),
+            format!("{}..HEAD", self.0.to_string()),
         ]
     }
 }
@@ -237,9 +299,19 @@ impl Checkout {
 }
 
 impl Subcommand for Checkout {
-    type ParsedOutput = String;
+    type ParsedOutput = NoOutput;
 
     fn args(&self) -> impl IntoIterator<Item = String> {
         ["checkout", self.0.as_str()].map(ToOwned::to_owned)
+    }
+}
+
+pub struct NoOutput;
+
+impl FromStr for NoOutput {
+    type Err = anyhow::Error;
+
+    fn from_str(_: &str) -> Result<Self, Self::Err> {
+        Ok(NoOutput)
     }
 }

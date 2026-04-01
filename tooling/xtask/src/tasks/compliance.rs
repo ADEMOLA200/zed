@@ -2,12 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use semver::Version;
 
 use crate::tasks::compliance::{
     checks::Reporter,
-    git::{Checkout, CommitsFromVersionToHead, GitCommand, VersionTag},
+    git::{Checkout, CommitsFromVersionToHead, GetVersionTags, GitCommand, VersionTag},
     github::GitHubClient,
+    report::ReportReviewSummary,
 };
 
 mod checks;
@@ -15,7 +15,7 @@ mod git;
 mod github;
 mod report;
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub(crate) enum ReleaseChannel {
     Stable,
     Preview,
@@ -32,43 +32,28 @@ impl ReleaseChannel {
 
 #[derive(Parser)]
 pub struct ComplianceArgs {
-    #[arg(value_parser = Version::parse)]
+    #[arg(value_parser = VersionTag::parse)]
     // The version to be on the lookout for
-    pub(crate) version: Version,
-    #[arg(value_enum, default_value_t = ReleaseChannel::Stable)]
-    // The release channel to check compliance for
-    release_channel: ReleaseChannel,
+    pub(crate) version_tag: VersionTag,
     #[arg(long)]
     // The markdown file to write the compliance report to
     report_path: PathBuf,
-
     #[arg(long)]
+    // An optional branch to use instead of the determined version branch
     branch: Option<String>,
 }
 
 impl ComplianceArgs {
-    #[allow(dead_code)]
-    pub(crate) fn version_tag(&self) -> VersionTag {
-        VersionTag::new(&self.version, self.release_channel)
-    }
-
-    pub(crate) fn previous_version_tag(&self) -> VersionTag {
-        // TODO make this more robust
-        let previous_version = Version::new(
-            self.version.major,
-            self.version.minor - 1,
-            self.version.patch,
-        );
-
-        VersionTag::new(&previous_version, self.release_channel)
+    pub(crate) fn version_tag(&self) -> &VersionTag {
+        &self.version_tag
     }
 
     fn version_branch(&self) -> String {
         self.branch.clone().unwrap_or_else(|| {
             format!(
                 "v{major}.{minor}.x",
-                major = self.version.major,
-                minor = self.version.minor
+                major = self.version_tag().version().major,
+                minor = self.version_tag().version().minor
             )
         })
     }
@@ -76,15 +61,26 @@ impl ComplianceArgs {
 
 async fn check_compliance_impl(args: ComplianceArgs) -> Result<()> {
     let in_workflow_context = std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true");
-    let tag = args.previous_version_tag();
+    let tag = args.version_tag();
+
+    let previous_version = GitCommand::run(GetVersionTags)?
+        .sorted()
+        .find_previous_version(&tag)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not find previous version for tag {tag}",
+                tag = tag.to_string()
+            )
+        })?;
 
     if !in_workflow_context {
         GitCommand::run(Checkout(args.version_branch()))?;
     }
 
-    println!("Checking compliance for version: {}", tag.0);
+    println!("Checking compliance for version {}", tag.version());
 
-    let commits = GitCommand::run(CommitsFromVersionToHead(tag.clone()))?;
+    let commits = GitCommand::run(CommitsFromVersionToHead(previous_version))?;
 
     println!("Found {} commits to check", commits.len());
 
@@ -111,21 +107,20 @@ async fn check_compliance_impl(args: ComplianceArgs) -> Result<()> {
         GitCommand::run(Checkout::previous_branch())?;
     }
 
-    if summary.every_commit_reviewed() {
-        println!("No issues found, compliance check passed.");
-        Ok(())
-    } else if summary.commits_reviewed_with_errors() {
-        println!("Issues found, compliance check failed.");
-        Err(anyhow::anyhow!(
+    match summary.review_summary() {
+        ReportReviewSummary::MissingReviews => Err(anyhow::anyhow!(
+            "Compliance check failed, found {} commits not reviewed",
+            summary.not_reviewed
+        )),
+        ReportReviewSummary::MissingReviewsWithErrors => Err(anyhow::anyhow!(
             "Compliance check failed with {} unreviewed commits and {} other issues",
             summary.not_reviewed,
             summary.errors
-        ))
-    } else {
-        Err(anyhow::anyhow!(
-            "Compliance check failed, found {} commits not reviewed",
-            summary.not_reviewed
-        ))
+        )),
+        ReportReviewSummary::NoIssuesFound => {
+            println!("No issues found, compliance check passed.");
+            Ok(())
+        }
     }
 }
 

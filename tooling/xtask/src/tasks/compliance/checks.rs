@@ -276,12 +276,16 @@ impl Reporter {
         for (i, commit) in commits_to_check.into_iter().enumerate() {
             println!(
                 "Checking commit {:?} ({current}/{total})",
-                commit.sha().as_str().split_at(8).0,
+                commit.sha().short(),
                 current = i + 1,
                 total = total_commits
             );
 
             let review_result = self.check_commit(&commit).await;
+
+            if let Err(err) = &review_result {
+                println!("Commit {:?} failed review: {:?}", commit.sha().short(), err);
+            }
 
             report.add(commit, review_result);
         }

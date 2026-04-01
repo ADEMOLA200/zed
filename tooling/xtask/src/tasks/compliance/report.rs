@@ -73,6 +73,12 @@ pub struct ReportSummary {
     pub(crate) errors: usize,
 }
 
+pub(crate) enum ReportReviewSummary {
+    MissingReviews,
+    MissingReviewsWithErrors,
+    NoIssuesFound,
+}
+
 impl ReportSummary {
     fn from_entries(entries: &[ReportEntry<ReviewResult>]) -> Self {
         Self {
@@ -98,12 +104,12 @@ impl ReportSummary {
         }
     }
 
-    pub fn every_commit_reviewed(&self) -> bool {
-        self.not_reviewed == 0 && self.errors == 0
-    }
-
-    pub fn commits_reviewed_with_errors(&self) -> bool {
-        self.not_reviewed == 0 && self.errors > 0
+    pub fn review_summary(&self) -> ReportReviewSummary {
+        match self.not_reviewed {
+            0 if self.errors == 0 => ReportReviewSummary::MissingReviews,
+            0 if self.errors > 0 => ReportReviewSummary::MissingReviewsWithErrors,
+            _ => ReportReviewSummary::NoIssuesFound,
+        }
     }
 }
 

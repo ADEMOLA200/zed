@@ -56,13 +56,12 @@ impl AgentTool for StreamingEchoTool {
 
     fn run(
         self: Arc<Self>,
-        mut input: ToolInput<Self::Input>,
+        input: ToolInput<Self::Input>,
         _event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let wait_until_complete_rx = self.wait_until_complete_rx.lock().unwrap().take();
         cx.spawn(async move |_cx| {
-            while input.recv_partial().await.is_some() {}
             let input = input
                 .recv()
                 .await
@@ -119,7 +118,7 @@ impl AgentTool for StreamingFailingEchoTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |_cx| {
             for _ in 0..self.receive_chunks_until_failure {
-                let _ = input.recv_partial().await;
+                let _ = input.next().await;
             }
             Err("failed".into())
         })

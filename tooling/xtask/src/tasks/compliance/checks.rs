@@ -4,7 +4,7 @@ use itertools::Itertools as _;
 use octocrab::models::{
     Author,
     issues::Comment,
-    pulls::{Review, ReviewState},
+    pulls::{PullRequest, Review, ReviewState},
 };
 
 use crate::tasks::compliance::{
@@ -118,11 +118,16 @@ impl Reporter {
             return Err(ReviewFailure::NoPullRequestFound);
         };
 
-        if let Some(approval) = self.check_pull_request_approved(pr_number).await? {
+        let pull_request = self.github_client.get_pull_request(pr_number).await?;
+
+        if let Some(approval) = self.check_pull_request_approved(&pull_request).await? {
             return Ok(approval);
         }
 
-        if let Some(approval) = self.check_approving_pull_request_comment(pr_number).await? {
+        if let Some(approval) = self
+            .check_approving_pull_request_comment(&pull_request)
+            .await?
+        {
             return Ok(approval);
         }
 
@@ -173,10 +178,8 @@ impl Reporter {
     #[allow(unused)]
     async fn check_external_merged_pr(
         &mut self,
-        pr_number: u64,
+        pull_request: PullRequest,
     ) -> Result<Option<ReviewSuccess>, ReviewFailure> {
-        let pull_request = self.github_client.get_pull_request(pr_number).await?;
-
         if let Some(user) = pull_request.user
             && self
                 .github_client
@@ -199,11 +202,11 @@ impl Reporter {
 
     async fn check_pull_request_approved(
         &mut self,
-        pr_number: u64,
+        pull_request: &PullRequest,
     ) -> Result<Option<ReviewSuccess>, ReviewFailure> {
         let pr_reviews = self
             .github_client
-            .get_pr_reviews(pr_number)
+            .get_pr_reviews(pull_request.number)
             .await?
             .take_items();
 
@@ -211,6 +214,8 @@ impl Reporter {
             let mut org_approving_reviews = Vec::new();
             for review in pr_reviews {
                 if let Some(github_login) = review.user.as_ref()
+                    && dbg!(pull_request.user.as_ref())
+                        .is_none_or(|pr_user| pr_user.login != github_login.login)
                     && review
                         .state
                         .is_some_and(|state| state == ReviewState::Approved)
@@ -234,11 +239,11 @@ impl Reporter {
 
     async fn check_approving_pull_request_comment(
         &mut self,
-        pr_number: u64,
+        pull_request: &PullRequest,
     ) -> Result<Option<ReviewSuccess>, ReviewFailure> {
         let other_comments = self
             .github_client
-            .get_pr_comments(pr_number)
+            .get_pr_comments(pull_request.number)
             .await?
             .take_items();
 
@@ -246,13 +251,18 @@ impl Reporter {
             let mut org_approving_comments = Vec::new();
 
             for comment in other_comments {
-                if comment.body.as_ref().is_some_and(|body| {
-                    body.contains(ZED_ZIPPY_COMMENT_APPROVAL_PATTERN)
-                        || body.contains(ZED_ZIPPY_GROUP_APPROVAL)
-                }) && self
-                    .github_client
-                    .check_org_membership(&GithubLogin::new(comment.user.login.clone()))
-                    .await?
+                if pull_request
+                    .user
+                    .as_ref()
+                    .is_some_and(|pr_author| pr_author.login != comment.user.login)
+                    && comment.body.as_ref().is_some_and(|body| {
+                        body.contains(ZED_ZIPPY_COMMENT_APPROVAL_PATTERN)
+                            || body.contains(ZED_ZIPPY_GROUP_APPROVAL)
+                    })
+                    && self
+                        .github_client
+                        .check_org_membership(&GithubLogin::new(comment.user.login.clone()))
+                        .await?
                 {
                     org_approving_comments.push(comment);
                 }

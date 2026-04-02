@@ -257,7 +257,7 @@ pub struct StreamingEditFileTool {
     language_registry: Arc<LanguageRegistry>,
 }
 
-enum EditLoopOutcome {
+enum EditSessionResult {
     Completed(EditSession),
     Failed {
         error: String,
@@ -340,12 +340,12 @@ impl StreamingEditFileTool {
         });
     }
 
-    async fn run_edit_loop(
+    async fn process_streaming_edits(
         &self,
         input: &mut ToolInput<StreamingEditFileToolInput>,
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
-    ) -> EditLoopOutcome {
+    ) -> EditSessionResult {
         let mut session: Option<EditSession> = None;
         let mut last_partial: Option<StreamingEditFileToolPartialInput> = None;
 
@@ -383,7 +383,7 @@ impl StreamingEditFileTool {
                                             Ok(created_session) => session = Some(created_session),
                                             Err(error) => {
                                                 log::error!("Failed to create edit session: {}", error);
-                                                return EditLoopOutcome::Failed {
+                                                return EditSessionResult::Failed {
                                                     error,
                                                     session: None,
                                                 };
@@ -395,7 +395,7 @@ impl StreamingEditFileTool {
                                         && let Err(error) = current_session.process(parsed, self, event_stream, cx)
                                     {
                                         log::error!("Failed to process edit: {}", error);
-                                        return EditLoopOutcome::Failed { error, session };
+                                        return EditSessionResult::Failed { error, session };
                                     }
                                 }
                             }
@@ -416,7 +416,7 @@ impl StreamingEditFileTool {
                                         Ok(created_session) => created_session,
                                         Err(error) => {
                                             log::error!("Failed to create edit session: {}", error);
-                                            return EditLoopOutcome::Failed {
+                                            return EditSessionResult::Failed {
                                                 error,
                                                 session: None,
                                             };
@@ -425,10 +425,10 @@ impl StreamingEditFileTool {
                                 };
 
                                 return match session.finalize(full_input, self, event_stream, cx).await {
-                                    Ok(()) => EditLoopOutcome::Completed(session),
+                                    Ok(()) => EditSessionResult::Completed(session),
                                     Err(error) => {
                                         log::error!("Failed to finalize edit: {}", error);
-                                        EditLoopOutcome::Failed {
+                                        EditSessionResult::Failed {
                                             error,
                                             session: Some(session),
                                         }
@@ -437,14 +437,14 @@ impl StreamingEditFileTool {
                             }
                             ToolInputPayload::InvalidJson { error_message } => {
                                 log::error!("Received invalid JSON: {error_message}");
-                                return EditLoopOutcome::Failed {
+                                return EditSessionResult::Failed {
                                     error: error_message,
                                     session,
                                 };
                             }
                         },
                         Err(error) => {
-                            return EditLoopOutcome::Failed {
+                            return EditSessionResult::Failed {
                                 error: format!("Failed to receive tool input: {error}"),
                                 session,
                             };
@@ -452,7 +452,7 @@ impl StreamingEditFileTool {
                     }
                 }
                 _ = event_stream.cancelled_by_user().fuse() => {
-                    return EditLoopOutcome::Failed {
+                    return EditSessionResult::Failed {
                         error: "Edit cancelled by user".to_string(),
                         session,
                     };
@@ -532,8 +532,11 @@ impl AgentTool for StreamingEditFileTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx: &mut AsyncApp| {
-            match self.run_edit_loop(&mut input, &event_stream, cx).await {
-                EditLoopOutcome::Completed(session) => {
+            match self
+                .process_streaming_edits(&mut input, &event_stream, cx)
+                .await
+            {
+                EditSessionResult::Completed(session) => {
                     self.ensure_buffer_saved(&session.buffer, cx).await;
                     let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
                     Ok(StreamingEditFileToolOutput::Success {
@@ -543,7 +546,7 @@ impl AgentTool for StreamingEditFileTool {
                         diff,
                     })
                 }
-                EditLoopOutcome::Failed {
+                EditSessionResult::Failed {
                     error,
                     session: Some(session),
                 } => {
@@ -555,7 +558,7 @@ impl AgentTool for StreamingEditFileTool {
                         diff,
                     })
                 }
-                EditLoopOutcome::Failed {
+                EditSessionResult::Failed {
                     error,
                     session: None,
                 } => Err(StreamingEditFileToolOutput::Error {

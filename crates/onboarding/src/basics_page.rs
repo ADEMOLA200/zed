@@ -1,10 +1,15 @@
 use std::sync::Arc;
 
 use client::TelemetrySettings;
+use collections::HashMap;
 use fs::Fs;
 use gpui::{Action, App, IntoElement};
+use project::agent_server_store::AllAgentServersSettings;
 use project::project_settings::ProjectSettings;
-use settings::{BaseKeymap, Settings, update_settings_file};
+use project::{AgentRegistryStore, RegistryAgent};
+use settings::{
+    BaseKeymap, CustomAgentServerSettings, Settings, SettingsStore, update_settings_file,
+};
 use theme::{Appearance, SystemAppearance, ThemeRegistry};
 use theme_settings::{ThemeAppearanceMode, ThemeName, ThemeSelection, ThemeSettings};
 use ui::{
@@ -520,16 +525,22 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl I
         .child(h_flex().gap_1().child(vscode).child(cursor))
 }
 
-fn render_agent_button(
-    icon: IconName,
-    label: SharedString,
-    installed: bool,
-    cx: &mut App,
-) -> impl IntoElement {
-    let id = format!("{}-id", label);
+const FEATURED_AGENT_IDS: &[&str] = &["claude-acp", "codex-acp", "github-copilot-cli", "cursor"];
+
+fn render_agent_button(agent: &RegistryAgent, installed: bool, cx: &mut App) -> impl IntoElement {
+    let agent_id = agent.id().to_string();
+    let name = agent.name().clone();
+    let element_id = format!("{}-onboarding", agent_id);
+
+    let icon = match agent.icon_path() {
+        Some(icon_path) => Icon::from_external_svg(icon_path.clone()),
+        None => Icon::new(IconName::Sparkle),
+    }
+    .size(IconSize::XSmall)
+    .color(Color::Muted);
 
     v_flex()
-        .id(id)
+        .id(element_id)
         .border_1()
         .border_color(cx.theme().colors().border_variant)
         .rounded_sm()
@@ -546,8 +557,8 @@ fn render_agent_button(
                 .gap_1()
                 .items_center()
                 .justify_center()
-                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-                .child(Label::new(label).size(LabelSize::Small)),
+                .child(icon)
+                .child(Label::new(name).size(LabelSize::Small)),
         )
         .child(
             h_flex()
@@ -573,9 +584,57 @@ fn render_agent_button(
                     }
                 }),
         )
+        .when(!installed, |this| {
+            let fs = <dyn Fs>::global(cx);
+            let agent_id = agent_id.clone();
+            this.on_click(move |_, _, cx| {
+                let agent_id = agent_id.clone();
+                update_settings_file(fs.clone(), cx, move |settings, _| {
+                    let agent_servers = settings.agent_servers.get_or_insert_default();
+                    agent_servers.entry(agent_id).or_insert_with(|| {
+                        CustomAgentServerSettings::Registry {
+                            env: Default::default(),
+                            default_mode: None,
+                            default_model: None,
+                            favorite_models: Vec::new(),
+                            default_config_options: HashMap::default(),
+                            favorite_config_option_values: HashMap::default(),
+                        }
+                    });
+                });
+            })
+        })
 }
 
 fn render_ai_section(cx: &mut App) -> impl IntoElement {
+    let registry_agents = AgentRegistryStore::try_global(cx)
+        .map(|store| store.read(cx).agents().to_vec())
+        .unwrap_or_default();
+
+    let installed_agents = cx
+        .global::<SettingsStore>()
+        .get::<AllAgentServersSettings>(None)
+        .clone();
+
+    let grid = FEATURED_AGENT_IDS.iter().fold(
+        div()
+            .w_full()
+            .mt_1p5()
+            .grid()
+            .grid_cols(FEATURED_AGENT_IDS.len() as u16)
+            .gap_2(),
+        |grid, agent_id| {
+            let Some(agent) = registry_agents
+                .iter()
+                .find(|a| a.id().as_ref() == *agent_id)
+            else {
+                return grid;
+            };
+            let is_installed = installed_agents.contains_key(*agent_id);
+            grid.child(render_agent_button(agent, is_installed, cx))
+        },
+    );
+
     v_flex()
         .gap_0p5()
         .child(Label::new("Agent Setup"))
@@ -583,44 +642,7 @@ fn render_ai_section(cx: &mut App) -> impl IntoElement {
             Label::new("Install your favorite agents and start your first thread.")
                 .color(Color::Muted),
         )
-        .child(
-            div()
-                .w_full()
-                .mt_1p5()
-                .grid()
-                .grid_cols(5)
-                .gap_2()
-                .child(render_agent_button(
-                    IconName::ZedAgent,
-                    "Zed".into(),
-                    false,
-                    cx,
-                ))
-                .child(render_agent_button(
-                    IconName::AiClaude,
-                    "Claude".into(),
-                    true,
-                    cx,
-                ))
-                .child(render_agent_button(
-                    IconName::AiOpenAi,
-                    "Codex".into(),
-                    true,
-                    cx,
-                ))
-                .child(render_agent_button(
-                    IconName::Copilot,
-                    "GitHub Copilot".into(),
-                    false,
-                    cx,
-                ))
-                .child(render_agent_button(
-                    IconName::EditorCursor,
-                    "Cursor".into(),
-                    false,
-                    cx,
-                )),
-        )
+        .child(grid)
 }
 
 pub(crate) fn render_basics_page(cx: &mut App) -> impl IntoElement {

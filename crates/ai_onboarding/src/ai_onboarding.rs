@@ -355,7 +355,7 @@ impl ZedAiOnboarding {
             .into_any_element()
     }
 
-    fn render_agent_layout(&self, cx: &mut App) -> AnyElement {
+    fn render_agent_layout(&self, _cx: &mut App) -> AnyElement {
         let description = "Introducing a threads sidebar, positioned in the far left of your workspace, that allows you to manage agents across many projects. Your agent thread lives right to the side of it, and all other panels move to the right.";
 
         v_flex()

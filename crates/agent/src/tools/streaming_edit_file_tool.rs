@@ -544,16 +544,11 @@ impl AgentTool for StreamingEditFileTool {
                     })
                 }
                 EditLoopOutcome::Failed {
-                    mut error,
+                    error,
                     session: Some(session),
                 } => {
                     self.ensure_buffer_saved(&session.buffer, cx).await;
                     let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
-                    if !diff.is_empty() {
-                        error.push_str("\nSome edits were applied");
-                    } else {
-                        error.push_str("\nNo edits were made");
-                    }
                     Err(StreamingEditFileToolOutput::Error {
                         error,
                         input_path: Some(session.input_path),
@@ -561,16 +556,13 @@ impl AgentTool for StreamingEditFileTool {
                     })
                 }
                 EditLoopOutcome::Failed {
-                    mut error,
+                    error,
                     session: None,
-                } => {
-                    error.push_str("\nNo edits were made");
-                    Err(StreamingEditFileToolOutput::Error {
-                        error,
-                        input_path: None,
-                        diff: String::new(),
-                    })
-                }
+                } => Err(StreamingEditFileToolOutput::Error {
+                    error,
+                    input_path: None,
+                    diff: String::new(),
+                }),
             }
         })
     }
@@ -1476,10 +1468,17 @@ mod tests {
             })
             .await;
 
-        let StreamingEditFileToolOutput::Error { error, .. } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error {
+            error,
+            diff,
+            input_path,
+        } = result.unwrap_err()
+        else {
             panic!("expected error");
         };
         assert_eq!(error, "Can't edit file: path not found");
+        assert!(diff.is_empty());
+        assert_eq!(input_path, None);
     }
 
     #[gpui::test]

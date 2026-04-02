@@ -334,7 +334,11 @@ impl MentionUri {
             }
             MentionUri::Directory { abs_path } => {
                 let mut url = Url::parse("file:///").unwrap();
-                url.set_path(&abs_path.to_string_lossy());
+                let mut path = abs_path.to_string_lossy().into_owned();
+                if !path.ends_with('/') {
+                    path.push('/');
+                }
+                url.set_path(&path);
                 url
             }
             MentionUri::Symbol {
@@ -497,6 +501,21 @@ mod tests {
         };
         let expected = uri!("file:///path/to/dir/");
         assert_eq!(uri.to_uri().to_string(), expected);
+    }
+
+    #[test]
+    fn test_directory_uri_round_trip_without_trailing_slash() {
+        let uri = MentionUri::Directory {
+            abs_path: PathBuf::from(path!("/path/to/dir")),
+        };
+        let serialized = uri.to_uri().to_string();
+        assert!(serialized.ends_with('/'), "directory URI must end with /");
+        let parsed = MentionUri::parse(&serialized, PathStyle::local()).unwrap();
+        assert!(
+            matches!(parsed, MentionUri::Directory { .. }),
+            "expected Directory variant, got {:?}",
+            parsed
+        );
     }
 
     #[test]

@@ -2305,12 +2305,12 @@ impl Thread {
             if tool.supports_input_streaming() {
                 let running_turn = self.running_turn.as_mut()?;
                 if let Some(sender) = running_turn.streaming_tool_inputs.get_mut(&tool_use.id) {
-                    sender.send(ToolInputPayload::Partial(tool_use.input));
+                    sender.send_partial(tool_use.input);
                     return None;
                 }
 
                 let (mut sender, tool_input) = ToolInputSender::channel();
-                sender.send(ToolInputPayload::Partial(tool_use.input));
+                sender.send_partial(tool_use.input);
                 running_turn
                     .streaming_tool_inputs
                     .insert(tool_use.id.clone(), sender);
@@ -2337,7 +2337,7 @@ impl Thread {
             .streaming_tool_inputs
             .remove(&tool_use.id)
         {
-            sender.send(ToolInputPayload::Full(tool_use.input));
+            sender.send_full(tool_use.input);
             return None;
         }
 
@@ -2450,7 +2450,7 @@ impl Thread {
                 .streaming_tool_inputs
                 .remove(&tool_use.id)
         {
-            sender.send(ToolInputPayload::InvalidJson { error_message });
+            sender.send_invalid_json(error_message);
             return None;
         }
 
@@ -3254,25 +3254,22 @@ impl ToolInputSender {
         self.has_received_final
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn send_partial(&mut self, payload: serde_json::Value) {
-        self.send(ToolInputPayload::Partial(payload))
+        self.tx
+            .unbounded_send(ToolInputPayload::Partial(payload))
+            .ok();
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn send_full(&mut self, payload: serde_json::Value) {
-        self.send(ToolInputPayload::Full(payload))
+        self.has_received_final = true;
+        self.tx.unbounded_send(ToolInputPayload::Full(payload)).ok();
     }
 
-    pub(crate) fn send(&mut self, payload: ToolInputPayload<serde_json::Value>) {
-        if matches!(
-            payload,
-            ToolInputPayload::Full(_) | ToolInputPayload::InvalidJson { .. }
-        ) {
-            self.has_received_final = true;
-        }
-
-        self.tx.unbounded_send(payload).ok();
+    pub fn send_invalid_json(&mut self, error_message: String) {
+        self.has_received_final = true;
+        self.tx
+            .unbounded_send(ToolInputPayload::InvalidJson { error_message })
+            .ok();
     }
 }
 

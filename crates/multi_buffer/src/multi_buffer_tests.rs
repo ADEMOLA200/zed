@@ -3096,6 +3096,7 @@ impl ReferenceMultibuffer {
             excerpt_start_offset: MultiBufferOffset,
             path_keys_by_buffer: &HashMap<BufferId, PathKey>,
         ) {
+            dbg!("----------");
             let len = text.len();
             let path_key = excerpt.path_key.clone();
 
@@ -3116,14 +3117,20 @@ impl ReferenceMultibuffer {
                 } else if &path_key == anchor_path_key {
                     assert_eq!(anchor.buffer_id, buffer.remote_id());
                     let anchor_offset = anchor.to_offset(buffer);
-
-                    if anchor_offset < buffer_range.start {
+                    dbg!(anchor.buffer_id);
+                    dbg!(anchor_offset);
+                    dbg!(&buffer_range);
+                    let buffer_anchor_range = buffer.anchor_range_outside(buffer_range.clone());
+                    dbg!(&buffer_anchor_range);
+                    dbg!(&excerpt.range);
+                    dbg!(&anchor);
+                    if anchor.cmp(&buffer_anchor_range.start, buffer).is_lt() {
                         // anchor is before the start of the buffer's first excerpt, or strictly between two excerpts
                         // resolves to the start of the following excerpt
                         anchors.next();
                         anchor_offsets.push(Some(excerpt_start_offset));
-                    } else if anchor_offset <= buffer_range.end {
-                        // anchor is contained within the excerpt
+                    } else if anchor.cmp(&buffer_anchor_range.end, buffer).is_le() {
+                        // anchor is contained within the region
                         let overshoot = anchor_offset - buffer_range.start;
                         anchors.next();
                         anchor_offsets.push(Some(MultiBufferOffset(overshoot + len)));
@@ -3337,7 +3344,6 @@ impl ReferenceMultibuffer {
                 );
 
                 text.push('\n');
-                if let Some(region) = regions.last_mut() {}
                 regions.last_mut().unwrap().range.end += 1;
             }
         }
@@ -3956,6 +3962,12 @@ fn check_multibuffer(
                 ]
             }),
     );
+    buffer_anchors.sort_by(|l, r| {
+        snapshot
+            .anchor_in_buffer(*l)
+            .unwrap()
+            .cmp(&snapshot.anchor_in_buffer(*r).unwrap(), &snapshot)
+    });
 
     let (expected_text, expected_row_infos, expected_boundary_rows, expected_anchor_offsets) =
         reference.expected_content(&buffer_anchors, cx);
@@ -6064,6 +6076,7 @@ fn test_cannot_seek_backward_after_excerpt_replacement(cx: &mut TestAppContext) 
 
 #[gpui::test]
 fn test_resolving_max_anchor_for_buffer(cx: &mut TestAppContext) {
+    // todo!() clean up
     let dock_base_text = indoc! {"
         0
         1
@@ -6164,138 +6177,49 @@ fn test_resolving_max_anchor_for_buffer(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_commit_view_multibuffer_setup(cx: &mut TestAppContext) {
-    let dock_new = include_str!("../test_fixtures/dock_new.rs");
-    let dock_old = include_str!("../test_fixtures/dock_old.rs");
-    let workspace_new = include_str!("../test_fixtures/workspace_new.rs");
-    let workspace_old = include_str!("../test_fixtures/workspace_old.rs");
+async fn test_resolving_max_anchor_at_end_of_excerpt(cx: &mut TestAppContext) {
+    // todo!() clean up
+    let dock_text = "first buffer\n";
+    let dock_buffer = cx.new(|cx| Buffer::local(dock_text, cx));
+    let workspace_text = "second buffer\n";
+    let workspace_buffer = cx.new(|cx| Buffer::local(workspace_text, cx));
 
-    let commit_message = "lol";
-    let context_line_count: u32 = 2;
+    let dock_path = PathKey::sorted(0);
+    let workspace_path = PathKey::sorted(1);
 
-    let message_buffer = cx.new(|cx| {
-        let mut buffer = Buffer::local(commit_message, cx);
-        buffer.set_capability(Capability::ReadOnly, cx);
-        buffer
-    });
-
-    let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadOnly));
+    let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));
 
     multibuffer.update(cx, |multibuffer, cx| {
-        let snapshot = message_buffer.read(cx).snapshot();
-        let full_range = Point::zero()..snapshot.max_point();
-        let range = ExcerptRange {
-            context: full_range.clone(),
-            primary: full_range,
-        };
         multibuffer.set_excerpt_ranges_for_path(
-            PathKey::with_sort_prefix(0, rel_path("commit message").into_arc()),
-            message_buffer.clone(),
-            &snapshot,
-            vec![range],
-            cx,
-        );
-    });
-
-    multibuffer.update(cx, |multibuffer, cx| {
-        multibuffer.set_all_diff_hunks_expanded(cx);
-    });
-
-    let dock_buffer = cx.new(|cx| {
-        let mut buffer = Buffer::local(dock_new, cx);
-        buffer.set_capability(Capability::ReadOnly, cx);
-        buffer
-    });
-    let dock_diff = cx.new(|cx| {
-        BufferDiff::new_with_base_text(dock_old, &dock_buffer.read(cx).text_snapshot(), cx)
-    });
-    cx.run_until_parked();
-
-    multibuffer.update(cx, |multibuffer, cx| {
-        let snapshot = dock_buffer.read(cx).snapshot();
-        let diff_snapshot = dock_diff.read(cx).snapshot(cx);
-        let excerpt_ranges: Vec<_> = diff_snapshot
-            .hunks(&snapshot)
-            .map(|hunk| hunk.buffer_range.to_point(&snapshot))
-            .collect();
-        multibuffer.set_excerpts_for_path(
-            PathKey::with_sort_prefix(1, rel_path("crates/workspace/src/dock.rs").into_arc()),
+            dock_path,
             dock_buffer.clone(),
-            excerpt_ranges,
-            context_line_count,
+            &dock_buffer.read(cx).snapshot(),
+            vec![ExcerptRange::new(Point::zero()..Point::zero())],
             cx,
         );
-        multibuffer.add_diff(dock_diff.clone(), cx);
-    });
-
-    let workspace_buffer = cx.new(|cx| {
-        let mut buffer = Buffer::local(workspace_new, cx);
-        buffer.set_capability(Capability::ReadOnly, cx);
-        buffer
-    });
-    let workspace_diff = cx.new(|cx| {
-        BufferDiff::new_with_base_text(
-            workspace_old,
-            &workspace_buffer.read(cx).text_snapshot(),
-            cx,
-        )
-    });
-    cx.run_until_parked();
-
-    multibuffer.update(cx, |multibuffer, cx| {
-        let snapshot = workspace_buffer.read(cx).snapshot();
-        let diff_snapshot = workspace_diff.read(cx).snapshot(cx);
-        let excerpt_ranges: Vec<_> = diff_snapshot
-            .hunks(&snapshot)
-            .map(|hunk| hunk.buffer_range.to_point(&snapshot))
-            .collect();
-        multibuffer.set_excerpts_for_path(
-            PathKey::with_sort_prefix(1, rel_path("crates/workspace/src/workspace.rs").into_arc()),
+        multibuffer.set_excerpt_ranges_for_path(
+            workspace_path,
             workspace_buffer.clone(),
-            excerpt_ranges,
-            context_line_count,
+            &workspace_buffer.read(cx).snapshot(),
+            vec![ExcerptRange::new(
+                Point::zero()..workspace_buffer.read(cx).max_point(),
+            )],
             cx,
         );
-        multibuffer.add_diff(workspace_diff.clone(), cx);
     });
 
     let snapshot = multibuffer.update(cx, |multibuffer, cx| multibuffer.snapshot(cx));
+    dbg!();
+    eprintln!("{}", snapshot.text());
 
-    let excerpts: Vec<_> = snapshot.excerpts().collect();
-    let dock_buffer_id = dock_buffer.read_with(cx, |buffer, _| buffer.remote_id());
-    let workspace_buffer_id = workspace_buffer.read_with(cx, |buffer, _| buffer.remote_id());
-    let message_buffer_id = message_buffer.read_with(cx, |buffer, _| buffer.remote_id());
-
-    let excerpt_buffer_ids: Vec<_> = excerpts.iter().map(|e| e.context.start.buffer_id).collect();
-
-    assert_eq!(
-        excerpt_buffer_ids[0], message_buffer_id,
-        "first excerpt should be from the commit message buffer"
-    );
-    for id in &excerpt_buffer_ids[1..] {
-        assert!(
-            *id == dock_buffer_id || *id == workspace_buffer_id,
-            "remaining excerpts should be from dock or workspace buffers, got {:?}",
-            id
-        );
-    }
-
-    let text = snapshot.text();
-    assert!(
-        text.starts_with(commit_message),
-        "multibuffer should start with the commit message"
-    );
-
-    let diff_hunks: Vec<_> = snapshot
-        .diff_hunks_in_range(MultiBufferOffset(0)..snapshot.len())
-        .collect();
-    assert!(
-        !diff_hunks.is_empty(),
-        "expected diff hunks to be present in the multibuffer"
-    );
-
-    assert_chunks_in_ranges(&snapshot);
-    assert_consistent_line_numbers(&snapshot);
-    assert_position_translation(&snapshot);
-    assert_line_indents(&snapshot);
+    multibuffer.update(cx, |_, cx| {
+        dbg!("---------------------------");
+        let point = snapshot
+            .anchor_in_buffer(text::Anchor::max_for_buffer(
+                dock_buffer.read(cx).remote_id(),
+            ))
+            .unwrap()
+            .to_point(&snapshot);
+        assert_eq!(point, Point::zero());
+    })
 }

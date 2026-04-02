@@ -525,7 +525,7 @@ impl AgentTool for StreamingEditFileTool {
                         }
                     }
                     _ = event_stream.cancelled_by_user().fuse() => {
-                        return Err(StreamingEditFileToolOutput::error("Edit cancelled by user"));
+                        return self.handle_output(Err((format!("Edit cancelled by user"), state)), cx).await
                     }
                 }
             }

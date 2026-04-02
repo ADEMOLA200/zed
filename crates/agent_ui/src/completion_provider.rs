@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use crate::DEFAULT_THREAD_TITLE;
 use crate::ThreadHistory;
 use acp_thread::MentionUri;
-use agent_client_protocol as acp;
+use agent_client_protocol_core::schema as acp;
 use anyhow::Result;
 use editor::{CompletionProvider, Editor, code_context_menus::COMPLETION_MENU_MAX_WIDTH};
 use futures::FutureExt as _;

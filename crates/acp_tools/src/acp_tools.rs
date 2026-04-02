@@ -1,12 +1,6 @@
-use std::{
-    cell::RefCell,
-    collections::HashSet,
-    fmt::Display,
-    rc::{Rc, Weak},
-    sync::Arc,
-};
+use std::{cell::RefCell, collections::HashSet, fmt::Display, sync::Arc};
 
-use agent_client_protocol as acp;
+use agent_client_protocol_core::schema as acp;
 use collections::HashMap;
 use gpui::{
     App, Empty, Entity, EventEmitter, FocusHandle, Focusable, Global, ListAlignment, ListState,
@@ -22,6 +16,42 @@ use util::ResultExt as _;
 use workspace::{
     Item, ItemHandle, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
 };
+
+// Stub types for the old streaming API which is not available in agent-client-protocol-core.
+// These allow the ACP debug panel code to compile but the streaming won't be active.
+#[allow(dead_code)]
+type RequestId = String;
+
+#[derive(Clone)]
+#[allow(dead_code)]
+enum StreamMessageDirection {
+    Incoming,
+    Outgoing,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+enum StreamMessageContent {
+    Request {
+        id: RequestId,
+        method: Arc<str>,
+        params: Option<serde_json::Value>,
+    },
+    Response {
+        id: RequestId,
+        result: Result<Option<serde_json::Value>, acp::Error>,
+    },
+    Notification {
+        method: Arc<str>,
+        params: Option<serde_json::Value>,
+    },
+}
+
+#[allow(dead_code)]
+struct StreamMessage {
+    direction: StreamMessageDirection,
+    message: StreamMessageContent,
+}
 
 actions!(dev, [OpenAcpLogs]);
 
@@ -49,7 +79,6 @@ pub struct AcpConnectionRegistry {
 
 struct ActiveConnection {
     agent_id: AgentId,
-    connection: Weak<acp::ClientSideConnection>,
 }
 
 impl AcpConnectionRegistry {
@@ -63,16 +92,9 @@ impl AcpConnectionRegistry {
         }
     }
 
-    pub fn set_active_connection(
-        &self,
-        agent_id: AgentId,
-        connection: &Rc<acp::ClientSideConnection>,
-        cx: &mut Context<Self>,
-    ) {
-        self.active_connection.replace(Some(ActiveConnection {
-            agent_id,
-            connection: Rc::downgrade(connection),
-        }));
+    pub fn set_active_connection(&self, agent_id: AgentId, cx: &mut Context<Self>) {
+        self.active_connection
+            .replace(Some(ActiveConnection { agent_id }));
         cx.notify();
     }
 }
@@ -90,9 +112,10 @@ struct WatchedConnection {
     agent_id: AgentId,
     messages: Vec<WatchedConnectionMessage>,
     list_state: ListState,
-    connection: Weak<acp::ClientSideConnection>,
-    incoming_request_methods: HashMap<acp::RequestId, Arc<str>>,
-    outgoing_request_methods: HashMap<acp::RequestId, Arc<str>>,
+    #[allow(dead_code)]
+    incoming_request_methods: HashMap<RequestId, Arc<str>>,
+    #[allow(dead_code)]
+    outgoing_request_methods: HashMap<RequestId, Arc<str>>,
     _task: Task<()>,
 }
 
@@ -124,38 +147,23 @@ impl AcpTools {
         };
 
         if let Some(watched_connection) = self.watched_connection.as_ref() {
-            if Weak::ptr_eq(
-                &watched_connection.connection,
-                &active_connection.connection,
-            ) {
+            if watched_connection.agent_id == active_connection.agent_id {
                 return;
             }
         }
 
-        if let Some(connection) = active_connection.connection.upgrade() {
-            let mut receiver = connection.subscribe();
-            let task = cx.spawn(async move |this, cx| {
-                while let Ok(message) = receiver.recv().await {
-                    this.update(cx, |this, cx| {
-                        this.push_stream_message(message, cx);
-                    })
-                    .ok();
-                }
-            });
-
-            self.watched_connection = Some(WatchedConnection {
-                agent_id: active_connection.agent_id.clone(),
-                messages: vec![],
-                list_state: ListState::new(0, ListAlignment::Bottom, px(2048.)),
-                connection: active_connection.connection.clone(),
-                incoming_request_methods: HashMap::default(),
-                outgoing_request_methods: HashMap::default(),
-                _task: task,
-            });
-        }
+        self.watched_connection = Some(WatchedConnection {
+            agent_id: active_connection.agent_id.clone(),
+            messages: vec![],
+            list_state: ListState::new(0, ListAlignment::Bottom, px(2048.)),
+            incoming_request_methods: HashMap::default(),
+            outgoing_request_methods: HashMap::default(),
+            _task: Task::ready(()),
+        });
     }
 
-    fn push_stream_message(&mut self, stream_message: acp::StreamMessage, cx: &mut Context<Self>) {
+    #[allow(dead_code)]
+    fn push_stream_message(&mut self, stream_message: StreamMessage, cx: &mut Context<Self>) {
         let Some(connection) = self.watched_connection.as_mut() else {
             return;
         };
@@ -163,27 +171,19 @@ impl AcpTools {
         let index = connection.messages.len();
 
         let (request_id, method, message_type, params) = match stream_message.message {
-            acp::StreamMessageContent::Request { id, method, params } => {
+            StreamMessageContent::Request { id, method, params } => {
                 let method_map = match stream_message.direction {
-                    acp::StreamMessageDirection::Incoming => {
-                        &mut connection.incoming_request_methods
-                    }
-                    acp::StreamMessageDirection::Outgoing => {
-                        &mut connection.outgoing_request_methods
-                    }
+                    StreamMessageDirection::Incoming => &mut connection.incoming_request_methods,
+                    StreamMessageDirection::Outgoing => &mut connection.outgoing_request_methods,
                 };
 
                 method_map.insert(id.clone(), method.clone());
                 (Some(id), method.into(), MessageType::Request, Ok(params))
             }
-            acp::StreamMessageContent::Response { id, result } => {
+            StreamMessageContent::Response { id, result } => {
                 let method_map = match stream_message.direction {
-                    acp::StreamMessageDirection::Incoming => {
-                        &mut connection.outgoing_request_methods
-                    }
-                    acp::StreamMessageDirection::Outgoing => {
-                        &mut connection.incoming_request_methods
-                    }
+                    StreamMessageDirection::Incoming => &mut connection.outgoing_request_methods,
+                    StreamMessageDirection::Outgoing => &mut connection.incoming_request_methods,
                 };
 
                 if let Some(method) = method_map.remove(&id) {
@@ -197,7 +197,7 @@ impl AcpTools {
                     )
                 }
             }
-            acp::StreamMessageContent::Notification { method, params } => {
+            StreamMessageContent::Notification { method, params } => {
                 (None, method.into(), MessageType::Notification, Ok(params))
             }
         };
@@ -243,8 +243,8 @@ impl AcpTools {
                 };
                 Some(serde_json::json!({
                     "_direction": match message.direction {
-                        acp::StreamMessageDirection::Incoming => "incoming",
-                        acp::StreamMessageDirection::Outgoing => "outgoing",
+                        StreamMessageDirection::Incoming => "incoming",
+                        StreamMessageDirection::Outgoing => "outgoing",
                     },
                     "_type": message.message_type.to_string().to_lowercase(),
                     "id": message.request_id,
@@ -326,10 +326,10 @@ impl AcpTools {
                         cx.notify()
                     }))
                     .child(match message.direction {
-                        acp::StreamMessageDirection::Incoming => Icon::new(IconName::ArrowDown)
+                        StreamMessageDirection::Incoming => Icon::new(IconName::ArrowDown)
                             .color(Color::Error)
                             .size(IconSize::Small),
-                        acp::StreamMessageDirection::Outgoing => Icon::new(IconName::ArrowUp)
+                        StreamMessageDirection::Outgoing => Icon::new(IconName::ArrowUp)
                             .color(Color::Success)
                             .size(IconSize::Small),
                     })
@@ -402,8 +402,8 @@ impl AcpTools {
 
 struct WatchedConnectionMessage {
     name: SharedString,
-    request_id: Option<acp::RequestId>,
-    direction: acp::StreamMessageDirection,
+    request_id: Option<RequestId>,
+    direction: StreamMessageDirection,
     message_type: MessageType,
     params: Result<Option<serde_json::Value>, acp::Error>,
     collapsed_params_md: Option<Entity<Markdown>>,
@@ -427,6 +427,7 @@ impl WatchedConnectionMessage {
     }
 }
 
+#[allow(dead_code)]
 fn collapsed_params_md(
     params: &serde_json::Value,
     language_registry: &Arc<LanguageRegistry>,
@@ -459,6 +460,7 @@ fn expanded_params_md(
     cx.new(|cx| Markdown::new(params_md.into(), Some(language_registry.clone()), None, cx))
 }
 
+#[allow(dead_code)]
 enum MessageType {
     Request,
     Response,

@@ -2,7 +2,7 @@ use super::tool_permissions::{
     SensitiveSettingsKind, authorize_symlink_access, canonicalize_worktree_roots,
     detect_symlink_escape, sensitive_settings_kind,
 };
-use agent_client_protocol::ToolKind;
+use agent_client_protocol_core::schema::ToolKind;
 use agent_settings::AgentSettings;
 use futures::FutureExt as _;
 use gpui::{App, Entity, SharedString, Task};
@@ -169,7 +169,7 @@ impl AgentTool for CreateDirectoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol as acp;
+    use agent_client_protocol_core::schema as acp;
     use fs::Fs as _;
     use gpui::TestAppContext;
     use project::{FakeFs, Project};

@@ -3,7 +3,7 @@ mod agent_profile;
 use std::path::{Component, Path};
 use std::sync::{Arc, LazyLock};
 
-use agent_client_protocol::ModelId;
+use agent_client_protocol_core::schema::ModelId;
 use collections::{HashSet, IndexMap};
 use fs::Fs;
 use gpui::{App, Pixels, px};

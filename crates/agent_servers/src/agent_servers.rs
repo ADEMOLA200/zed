@@ -48,31 +48,34 @@ pub trait AgentServer: Send {
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
 
-    fn default_mode(&self, _cx: &App) -> Option<agent_client_protocol::SessionModeId> {
+    fn default_mode(&self, _cx: &App) -> Option<agent_client_protocol_core::schema::SessionModeId> {
         None
     }
 
     fn set_default_mode(
         &self,
-        _mode_id: Option<agent_client_protocol::SessionModeId>,
+        _mode_id: Option<agent_client_protocol_core::schema::SessionModeId>,
         _fs: Arc<dyn Fs>,
         _cx: &mut App,
     ) {
     }
 
-    fn default_model(&self, _cx: &App) -> Option<agent_client_protocol::ModelId> {
+    fn default_model(&self, _cx: &App) -> Option<agent_client_protocol_core::schema::ModelId> {
         None
     }
 
     fn set_default_model(
         &self,
-        _model_id: Option<agent_client_protocol::ModelId>,
+        _model_id: Option<agent_client_protocol_core::schema::ModelId>,
         _fs: Arc<dyn Fs>,
         _cx: &mut App,
     ) {
     }
 
-    fn favorite_model_ids(&self, _cx: &mut App) -> HashSet<agent_client_protocol::ModelId> {
+    fn favorite_model_ids(
+        &self,
+        _cx: &mut App,
+    ) -> HashSet<agent_client_protocol_core::schema::ModelId> {
         HashSet::default()
     }
 
@@ -91,16 +94,16 @@ pub trait AgentServer: Send {
 
     fn favorite_config_option_value_ids(
         &self,
-        _config_id: &agent_client_protocol::SessionConfigId,
+        _config_id: &agent_client_protocol_core::schema::SessionConfigId,
         _cx: &mut App,
-    ) -> HashSet<agent_client_protocol::SessionConfigValueId> {
+    ) -> HashSet<agent_client_protocol_core::schema::SessionConfigValueId> {
         HashSet::default()
     }
 
     fn toggle_favorite_config_option_value(
         &self,
-        _config_id: agent_client_protocol::SessionConfigId,
-        _value_id: agent_client_protocol::SessionConfigValueId,
+        _config_id: agent_client_protocol_core::schema::SessionConfigId,
+        _value_id: agent_client_protocol_core::schema::SessionConfigValueId,
         _should_be_favorite: bool,
         _fs: Arc<dyn Fs>,
         _cx: &App,
@@ -109,7 +112,7 @@ pub trait AgentServer: Send {
 
     fn toggle_favorite_model(
         &self,
-        _model_id: agent_client_protocol::ModelId,
+        _model_id: agent_client_protocol_core::schema::ModelId,
         _should_be_favorite: bool,
         _fs: Arc<dyn Fs>,
         _cx: &App,

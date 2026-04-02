@@ -1,5 +1,5 @@
 use action_log::ActionLog;
-use agent_client_protocol::{self as acp, ToolCallUpdateFields};
+use agent_client_protocol_core::schema::{self as acp, ToolCallUpdateFields};
 use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
 use gpui::{App, Entity, SharedString, Task};
@@ -347,7 +347,7 @@ impl AgentTool for ReadFileTool {
 #[cfg(test)]
 mod test {
     use super::*;
-    use agent_client_protocol as acp;
+    use agent_client_protocol_core::schema as acp;
     use fs::Fs as _;
     use gpui::{AppContext, TestAppContext, UpdateGlobal as _};
     use project::{FakeFs, Project};

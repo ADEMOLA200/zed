@@ -1,7 +1,7 @@
 use std::{cmp::Reverse, rc::Rc, sync::Arc};
 
 use acp_thread::{AgentModelIcon, AgentModelInfo, AgentModelList, AgentModelSelector};
-use agent_client_protocol::ModelId;
+use agent_client_protocol_core::schema::ModelId;
 use agent_servers::AgentServer;
 use agent_settings::AgentSettings;
 use anyhow::Result;
@@ -533,7 +533,7 @@ async fn fuzzy_search(
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol as acp;
+    use agent_client_protocol_core::schema as acp;
     use gpui::TestAppContext;
 
     use super::*;

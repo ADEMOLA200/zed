@@ -11,7 +11,7 @@ use crate::{
 };
 use acp_thread::Diff;
 use action_log::ActionLog;
-use agent_client_protocol::{self as acp, ToolCallLocation, ToolCallUpdateFields};
+use agent_client_protocol_core::schema::{self as acp, ToolCallLocation, ToolCallUpdateFields};
 use anyhow::{Context as _, Result};
 use collections::HashSet;
 use futures::FutureExt as _;

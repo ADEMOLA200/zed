@@ -1,6 +1,6 @@
 use crate::{AgentServer, AgentServerDelegate, load_proxy_env};
 use acp_thread::AgentConnection;
-use agent_client_protocol as acp;
+use agent_client_protocol_core::schema as acp;
 use anyhow::{Context as _, Result};
 use collections::HashSet;
 use credentials_provider::CredentialsProvider;

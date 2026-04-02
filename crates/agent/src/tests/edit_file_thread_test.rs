@@ -203,21 +203,18 @@ async fn test_edit_file_tool_in_thread_context(cx: &mut TestAppContext) {
     });
 }
 
-/// Reproduces the cascade described in the eval report:
+/// Verifies that a streaming `edit_file` JSON parse error does not leave the
+/// buffer in a state that breaks the retry.
 ///
-/// 1. The LLM streams partial edit_file JSON that starts modifying the buffer.
-/// 2. At ContentBlockStop, the accumulated JSON is malformed → ToolUseJsonParseError.
-/// 3. handle_tool_use_json_parse_error_event does NOT finalize the ToolInputSender.
-/// 4. The orphaned sender is drained at stream-end; the tool errors with
-///    "tool input was not fully received".
-/// 5. The buffer was partially written during streaming and is now **dirty**.
-/// 6. On retry, the model sends a fresh edit_file call for the same file.
-/// 7. ensure_buffer_saved detects the dirty buffer → "unsaved changes" error.
-///
-/// This test verifies step 7: the retry's tool result reports the unsaved
-/// changes error, proving the cascade from the orphaned sender.
+/// 1. The LLM streams partial `edit_file` JSON that starts modifying the buffer.
+/// 2. At `ContentBlockStop`, the accumulated JSON is malformed → `ToolUseJsonParseError`.
+/// 3. The thread retries.
+/// 4. On retry, the model sends a fresh, complete `edit_file` call for the same file.
+/// 5. The second edit succeeds and is saved without surfacing a stale unsaved-changes error.
 #[gpui::test]
-async fn test_streaming_edit_json_parse_error_cascades_to_unsaved_changes(cx: &mut TestAppContext) {
+async fn test_streaming_edit_json_parse_error_does_not_cause_unsaved_changes(
+    cx: &mut TestAppContext,
+) {
     super::init_test(cx);
     super::always_allow_tools(cx);
 
@@ -302,7 +299,7 @@ async fn test_streaming_edit_json_parse_error_cascades_to_unsaved_changes(cx: &m
     cx.run_until_parked();
 
     // Second partial: same path again (path_complete = true) + content.
-    // This creates the EditSession and writes to the buffer, making it dirty.
+    // This creates the EditSession and starts applying the streamed write.
     let partial_2 = LanguageModelToolUse {
         id: tool_use_id.into(),
         name: EditFileTool::NAME.into(),
@@ -379,16 +376,22 @@ async fn test_streaming_edit_json_parse_error_cascades_to_unsaved_changes(cx: &m
     fake_model.end_last_completion_stream();
     cx.run_until_parked();
 
-    // Advance clock again in case there's another retry delay.
+    // Advance clock again to ensure the successful retry does not schedule
+    // another retry due to a stale unsaved-changes error.
     cx.executor().advance_clock(Duration::from_secs(5));
     cx.run_until_parked();
 
-    // ── Verify the cascade ──────────────────────────────────────────────
-    // The thread should have retried again. Find the tool result for edit_2.
-    let completion = fake_model
-        .pending_completions()
-        .pop()
-        .expect("Thread should have retried after the unsaved changes error");
+    // ── Verify the retry succeeded gracefully ───────────────────────────
+    let pending_completions = fake_model.pending_completions();
+    assert!(
+        pending_completions.len() == 1,
+        "Expected only the follow-up completion containing the successful tool result"
+    );
+
+    let completion = pending_completions
+        .into_iter()
+        .last()
+        .expect("Expected a completion containing the tool result for edit_2");
 
     let tool_result = completion
         .messages
@@ -404,11 +407,9 @@ async fn test_streaming_edit_json_parse_error_cascades_to_unsaved_changes(cx: &m
         })
         .expect("Should have a tool result for edit_2");
 
-    // The tool result should be an error about unsaved changes —
-    // the cascade from the orphaned sender leaving the buffer dirty.
     assert!(
-        tool_result.is_error,
-        "Tool result should be an error, got: {:?}",
+        !tool_result.is_error,
+        "Tool result should succeed, got: {:?}",
         tool_result
     );
     let content_text = match &tool_result.content {
@@ -416,12 +417,24 @@ async fn test_streaming_edit_json_parse_error_cascades_to_unsaved_changes(cx: &m
         other => panic!("Expected text content, got: {:?}", other),
     };
     assert!(
-        content_text.contains("unsaved changes"),
-        "Expected 'unsaved changes' error from ensure_buffer_saved, got: {content_text}"
+        !content_text.contains("file has been modified since you last read it"),
+        "Did not expect a stale last-read error, got: {content_text}"
+    );
+    assert!(
+        !content_text.contains("This file has unsaved changes"),
+        "Did not expect an unsaved-changes error, got: {content_text}"
     );
 
-    // Clean up: complete the turn.
-    fake_model.send_last_completion_stream_text_chunk("I see the file has unsaved changes.");
+    let file_content = fs
+        .load(path!("/project/src/main.rs").as_ref())
+        .await
+        .expect("file should exist");
+    super::assert_eq!(
+        file_content,
+        "fn main() {\n    println!(\"Hello, rewritten!\");\n}\n",
+        "The second edit should be applied and saved gracefully"
+    );
+
     fake_model.end_last_completion_stream();
     cx.run_until_parked();
 }

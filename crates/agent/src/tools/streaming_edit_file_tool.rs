@@ -13,7 +13,7 @@ use crate::{
 use acp_thread::Diff;
 use action_log::ActionLog;
 use agent_client_protocol::{self as acp, ToolCallLocation, ToolCallUpdateFields};
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use collections::HashSet;
 use futures::FutureExt as _;
 use gpui::{App, AppContext, AsyncApp, Entity, Task, WeakEntity};
@@ -300,6 +300,70 @@ impl StreamingEditFileTool {
             });
         }
     }
+
+    async fn ensure_buffer_saved(&self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
+        let format_on_save_enabled = buffer.read_with(cx, |buffer, cx| {
+            let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
+            settings.format_on_save != FormatOnSave::Off
+        });
+
+        if format_on_save_enabled {
+            self.project
+                .update(cx, |project, cx| {
+                    project.format(
+                        HashSet::from_iter([buffer.clone()]),
+                        LspFormatTarget::Buffers,
+                        false,
+                        FormatTrigger::Save,
+                        cx,
+                    )
+                })
+                .await
+                .log_err();
+        }
+
+        self.project
+            .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+            .await
+            .log_err();
+
+        self.action_log.update(cx, |log, cx| {
+            log.buffer_edited(buffer.clone(), cx);
+        });
+    }
+
+    async fn handle_output(
+        &self,
+        result: Result<EditSession, (String, Option<EditSession>)>,
+        cx: &mut AsyncApp,
+    ) -> Result<StreamingEditFileToolOutput, StreamingEditFileToolOutput> {
+        match result {
+            Ok(session) => {
+                self.ensure_buffer_saved(&session.buffer, cx).await;
+                let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
+                Ok(StreamingEditFileToolOutput::Success {
+                    old_text: session.old_text.clone(),
+                    new_text,
+                    input_path: session.input_path,
+                    diff,
+                })
+            }
+            Err((error, Some(session))) => {
+                self.ensure_buffer_saved(&session.buffer, cx).await;
+                let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
+                Err(StreamingEditFileToolOutput::Error {
+                    error,
+                    input_path: Some(session.input_path),
+                    diff,
+                })
+            }
+            Err((error, None)) => Err(StreamingEditFileToolOutput::Error {
+                error,
+                input_path: None,
+                diff: String::new(),
+            }),
+        }
+    }
 }
 
 impl AgentTool for StreamingEditFileTool {
@@ -408,15 +472,15 @@ impl AgentTool for StreamingEditFileTool {
                                                 Ok(session) => state = Some(session),
                                                 Err(e) => {
                                                     log::error!("Failed to create edit session: {}", e);
-                                                    return Err(e);
+                                                    return self.handle_output(Err((e, None)), cx).await;
                                                 }
                                             }
                                         }
 
-                                        if let Some(state) = &mut state {
-                                            if let Err(e) = state.process(parsed, &self, &event_stream, cx) {
+                                        if let Some(state_ref) = &mut state {
+                                            if let Err(e) = state_ref.process(parsed, &self, &event_stream, cx) {
                                                 log::error!("Failed to process edit: {}", e);
-                                                return Err(e);
+                                                return self.handle_output(Err((e, state)), cx).await;
                                             }
                                         }
                                     }
@@ -426,7 +490,7 @@ impl AgentTool for StreamingEditFileTool {
                                         state
                                     } else {
                                         match EditSession::new(
-                                            full_input.path,
+                                            full_input.path.clone(),
                                             &full_input.display_description,
                                             full_input.mode,
                                             &self,
@@ -438,37 +502,25 @@ impl AgentTool for StreamingEditFileTool {
                                             Ok(session) => session,
                                             Err(e) => {
                                                 log::error!("Failed to create edit session: {}", e);
-                                                return Err(e);
+                                                return self.handle_output(Err((e, None)), cx).await;
                                             }
                                         }
                                     };
                                     return match state.finalize(full_input, &self, &event_stream, cx).await {
-                                        Ok(output) => Ok(output),
+                                        Ok(_) => self.handle_output(Ok(state), cx).await,
                                         Err(e) => {
                                             log::error!("Failed to finalize edit: {}", e);
-                                            Err(e)
+                                            self.handle_output(Err((e, Some(state))), cx).await
                                         }
                                     }
                                 },
                                 ToolInputPayload::InvalidJson { error_message } => {
                                     log::error!("Received invalid JSON: {error_message}");
-                                    if let Some(mut state) = state {
-                                        state.ensure_buffer_saved(&self, cx).await;
-                                        let (_new_text, unified_diff) = state.compute_new_text_and_diff(cx).await;
-                                        return Err(StreamingEditFileToolOutput::Error {
-                                            diff: unified_diff,
-                                            input_path: Some(state.input_path.clone()),
-                                            error: error_message,
-                                        });
-                                    } else {
-                                        return Err(StreamingEditFileToolOutput::error(error_message));
-                                    }
+                                    return self.handle_output(Err((error_message, state)), cx).await
                                 },
                             }
                             Err(e) => {
-                                let err = StreamingEditFileToolOutput::error(format!("Failed to receive tool input: {e}"));
-                                log::error!("Failed to receive tool input: {e}");
-                                return Err(err);
+                                return self.handle_output(Err((format!("Failed to receive tool input: {e}"), state)), cx).await
                             }
                         }
                     }
@@ -565,17 +617,15 @@ impl EditSession {
         tool: &StreamingEditFileTool,
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
-    ) -> Result<Self, StreamingEditFileToolOutput> {
-        let project_path = cx
-            .update(|cx| resolve_path(mode, &path, &tool.project, cx))
-            .map_err(|e| StreamingEditFileToolOutput::error(e.to_string()))?;
+    ) -> Result<Self, String> {
+        let project_path = cx.update(|cx| resolve_path(mode, &path, &tool.project, cx))?;
 
         let Some(abs_path) = cx.update(|cx| tool.project.read(cx).absolute_path(&project_path, cx))
         else {
-            return Err(StreamingEditFileToolOutput::error(format!(
+            return Err(format!(
                 "Worktree at '{}' does not exist",
                 path.to_string_lossy()
-            )));
+            ));
         };
 
         event_stream.update_fields(
@@ -584,13 +634,13 @@ impl EditSession {
 
         cx.update(|cx| tool.authorize(&path, &display_description, event_stream, cx))
             .await
-            .map_err(|e| StreamingEditFileToolOutput::error(e.to_string()))?;
+            .map_err(|e| e.to_string())?;
 
         let buffer = tool
             .project
             .update(cx, |project, cx| project.open_buffer(project_path, cx))
             .await
-            .map_err(|e| StreamingEditFileToolOutput::error(e.to_string()))?;
+            .map_err(|e| e.to_string())?;
 
         ensure_buffer_saved(&buffer, &abs_path, tool, cx)?;
 
@@ -636,20 +686,20 @@ impl EditSession {
         tool: &StreamingEditFileTool,
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
-    ) -> Result<StreamingEditFileToolOutput, StreamingEditFileToolOutput> {
+    ) -> Result<(), String> {
         match input.mode {
             StreamingEditFileMode::Write => {
-                let content = input.content.ok_or_else(|| {
-                    StreamingEditFileToolOutput::error("'content' field is required for write mode")
-                })?;
+                let content = input
+                    .content
+                    .ok_or_else(|| "'content' field is required for write mode".to_string())?;
 
                 let events = self.parser.finalize_content(&content);
                 self.process_events(&events, tool, event_stream, cx)?;
             }
             StreamingEditFileMode::Edit => {
-                let edits = input.edits.ok_or_else(|| {
-                    StreamingEditFileToolOutput::error("'edits' field is required for edit mode")
-                })?;
+                let edits = input
+                    .edits
+                    .ok_or_else(|| "'edits' field is required for edit mode".to_string())?;
                 let events = self.parser.finalize_edits(&edits);
                 self.process_events(&events, tool, event_stream, cx)?;
 
@@ -665,32 +715,7 @@ impl EditSession {
                 }
             }
         }
-
-        futures::select! {
-            _ = self.ensure_buffer_saved(tool, cx).fuse() => {},
-            _ = event_stream.cancelled_by_user().fuse() => {
-                return Err(StreamingEditFileToolOutput::error("Edit cancelled by user"));
-            }
-        };
-
-        tool.action_log.update(cx, |log, cx| {
-            log.buffer_edited(self.buffer.clone(), cx);
-        });
-
-        let (new_text, unified_diff) = futures::select! {
-            result = self.compute_new_text_and_diff(cx).fuse() => result,
-            _ = event_stream.cancelled_by_user().fuse() => {
-                return Err(StreamingEditFileToolOutput::error("Edit cancelled by user"));
-            }
-        };
-
-        let output = StreamingEditFileToolOutput::Success {
-            input_path: input.path,
-            new_text,
-            old_text: self.old_text.clone(),
-            diff: unified_diff,
-        };
-        Ok(output)
+        Ok(())
     }
 
     async fn compute_new_text_and_diff(&self, cx: &mut AsyncApp) -> (String, String) {
@@ -709,46 +734,13 @@ impl EditSession {
         (new_text, unified_diff)
     }
 
-    async fn ensure_buffer_saved(&mut self, tool: &StreamingEditFileTool, cx: &mut AsyncApp) {
-        let format_on_save_enabled = self.buffer.read_with(cx, |buffer, cx| {
-            let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
-            settings.format_on_save != FormatOnSave::Off
-        });
-
-        if format_on_save_enabled {
-            tool.action_log.update(cx, |log, cx| {
-                log.buffer_edited(self.buffer.clone(), cx);
-            });
-
-            tool.project
-                .update(cx, |project, cx| {
-                    project.format(
-                        HashSet::from_iter([self.buffer.clone()]),
-                        LspFormatTarget::Buffers,
-                        false,
-                        FormatTrigger::Save,
-                        cx,
-                    )
-                })
-                .await
-                .log_err();
-        }
-
-        tool.project
-            .update(cx, |project, cx| {
-                project.save_buffer(self.buffer.clone(), cx)
-            })
-            .await
-            .log_err();
-    }
-
     fn process(
         &mut self,
         partial: StreamingEditFileToolPartialInput,
         tool: &StreamingEditFileTool,
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
-    ) -> Result<(), StreamingEditFileToolOutput> {
+    ) -> Result<(), String> {
         match &self.mode {
             StreamingEditFileMode::Write => {
                 if let Some(content) = &partial.content {
@@ -772,7 +764,7 @@ impl EditSession {
         tool: &StreamingEditFileTool,
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
-    ) -> Result<(), StreamingEditFileToolOutput> {
+    ) -> Result<(), String> {
         for event in events {
             match event {
                 ToolEditEvent::ContentChunk { chunk } => {
@@ -1022,14 +1014,14 @@ fn extract_match(
     buffer: &Entity<Buffer>,
     edit_index: &usize,
     cx: &mut AsyncApp,
-) -> Result<Range<usize>, StreamingEditFileToolOutput> {
+) -> Result<Range<usize>, String> {
     match matches.len() {
-        0 => Err(StreamingEditFileToolOutput::error(format!(
+        0 => Err(format!(
             "Could not find matching text for edit at index {}. \
                 The old_text did not match any content in the file. \
                 Please read the file again to get the current content.",
             edit_index,
-        ))),
+        )),
         1 => Ok(matches.into_iter().next().unwrap()),
         _ => {
             let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
@@ -1038,12 +1030,12 @@ fn extract_match(
                 .map(|r| (snapshot.offset_to_point(r.start).row + 1).to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            Err(StreamingEditFileToolOutput::error(format!(
+            Err(format!(
                 "Edit {} matched multiple locations in the file at lines: {}. \
                     Please provide more context in old_text to uniquely \
                     identify the location.",
                 edit_index, lines
-            )))
+            ))
         }
     }
 }
@@ -1075,7 +1067,7 @@ fn ensure_buffer_saved(
     abs_path: &PathBuf,
     tool: &StreamingEditFileTool,
     cx: &mut AsyncApp,
-) -> Result<(), StreamingEditFileToolOutput> {
+) -> Result<(), String> {
     let last_read_mtime = tool
         .action_log
         .read_with(cx, |log, _| log.file_read_time(abs_path));
@@ -1116,15 +1108,14 @@ fn ensure_buffer_saved(
                          then ask them to save or revert the file manually and inform you when it's ok to proceed."
             }
         };
-        return Err(StreamingEditFileToolOutput::error(message));
+        return Err(message.to_string());
     }
 
     if let (Some(last_read), Some(current)) = (last_read_mtime, current_mtime) {
         if current != last_read {
-            return Err(StreamingEditFileToolOutput::error(
-                "The file has been modified since you last read it. \
-                             Please read the file again to get the current state before editing it.",
-            ));
+            return Err("The file has been modified since you last read it. \
+                    Please read the file again to get the current state before editing it."
+                .to_string());
         }
     }
 
@@ -1136,56 +1127,63 @@ fn resolve_path(
     path: &PathBuf,
     project: &Entity<Project>,
     cx: &mut App,
-) -> Result<ProjectPath> {
+) -> Result<ProjectPath, String> {
     let project = project.read(cx);
 
     match mode {
         StreamingEditFileMode::Edit => {
             let path = project
                 .find_project_path(&path, cx)
-                .context("Can't edit file: path not found")?;
+                .ok_or_else(|| "Can't edit file: path not found".to_string())?;
 
             let entry = project
                 .entry_for_path(&path, cx)
-                .context("Can't edit file: path not found")?;
+                .ok_or_else(|| "Can't edit file: path not found".to_string())?;
 
-            anyhow::ensure!(entry.is_file(), "Can't edit file: path is a directory");
-            Ok(path)
+            if entry.is_file() {
+                Ok(path)
+            } else {
+                Err("Can't edit file: path is a directory".to_string())
+            }
         }
         StreamingEditFileMode::Write => {
             if let Some(path) = project.find_project_path(&path, cx)
                 && let Some(entry) = project.entry_for_path(&path, cx)
             {
-                anyhow::ensure!(entry.is_file(), "Can't write to file: path is a directory");
-                return Ok(path);
+                if entry.is_file() {
+                    return Ok(path);
+                } else {
+                    return Err("Can't write to file: path is a directory".to_string());
+                }
             }
 
-            let parent_path = path.parent().context("Can't create file: incorrect path")?;
+            let parent_path = path
+                .parent()
+                .ok_or_else(|| "Can't create file: incorrect path".to_string())?;
 
             let parent_project_path = project.find_project_path(&parent_path, cx);
 
             let parent_entry = parent_project_path
                 .as_ref()
                 .and_then(|path| project.entry_for_path(path, cx))
-                .context("Can't create file: parent directory doesn't exist")?;
+                .ok_or_else(|| "Can't create file: parent directory doesn't exist")?;
 
-            anyhow::ensure!(
-                parent_entry.is_dir(),
-                "Can't create file: parent is not a directory"
-            );
+            if !parent_entry.is_dir() {
+                return Err("Can't create file: parent is not a directory".to_string());
+            }
 
             let file_name = path
                 .file_name()
                 .and_then(|file_name| file_name.to_str())
                 .and_then(|file_name| RelPath::unix(file_name).ok())
-                .context("Can't create file: invalid filename")?;
+                .ok_or_else(|| "Can't create file: invalid filename".to_string())?;
 
             let new_file_path = parent_project_path.map(|parent| ProjectPath {
                 path: parent.path.join(file_name),
                 ..parent
             });
 
-            new_file_path.context("Can't create file")
+            new_file_path.ok_or_else(|| "Can't create file".to_string())
         }
     }
 }
@@ -1464,7 +1462,7 @@ mod tests {
             })
             .await;
 
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error { error, .. } = result.unwrap_err() else {
             panic!("expected error");
         };
         assert!(
@@ -1574,7 +1572,7 @@ mod tests {
         drop(sender);
 
         let result = task.await;
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error { error, .. } = result.unwrap_err() else {
             panic!("expected error");
         };
         assert!(
@@ -1946,16 +1944,17 @@ mod tests {
         }));
         cx.run_until_parked();
 
-        // Verify edit 1 was applied
-        let buffer_text = project.update(cx, |project, cx| {
+        let buffer = project.update(cx, |project, cx| {
             let pp = project
                 .find_project_path(&PathBuf::from("root/file.txt"), cx)
                 .unwrap();
-            project.get_open_buffer(&pp, cx).map(|b| b.read(cx).text())
+            project.get_open_buffer(&pp, cx).unwrap()
         });
+
+        // Verify edit 1 was applied
+        let buffer_text = buffer.read_with(cx, |buffer, _cx| buffer.text());
         assert_eq!(
-            buffer_text.as_deref(),
-            Some("MODIFIED\nline 2\nline 3\n"),
+            buffer_text, "MODIFIED\nline 2\nline 3\n",
             "First edit should be applied even though second edit will fail"
         );
 
@@ -1978,12 +1977,24 @@ mod tests {
         drop(sender);
 
         let result = task.await;
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error {
+            error,
+            diff,
+            input_path,
+        } = result.unwrap_err()
+        else {
             panic!("expected error");
         };
+
         assert!(
             error.contains("Could not find matching text for edit at index 1"),
             "Expected error about edit 1 failing, got: {error}"
+        );
+        // Ensure that first edit was applied successfully and that we saved the buffer
+        assert_eq!(input_path, Some(PathBuf::from("root/file.txt")));
+        assert_eq!(
+            diff,
+            "@@ -1,3 +1,3 @@\n-line 1\n+MODIFIED\n line 2\n line 3\n"
         );
     }
 
@@ -2202,7 +2213,7 @@ mod tests {
         mode: &StreamingEditFileMode,
         path: &str,
         cx: &mut TestAppContext,
-    ) -> anyhow::Result<ProjectPath> {
+    ) -> Result<ProjectPath, String> {
         init_test(cx);
 
         let fs = project::FakeFs::new(cx.executor());
@@ -2223,7 +2234,7 @@ mod tests {
     }
 
     #[track_caller]
-    fn assert_resolved_path_eq(path: anyhow::Result<ProjectPath>, expected: &RelPath) {
+    fn assert_resolved_path_eq(path: Result<ProjectPath, String>, expected: &RelPath) {
         let actual = path.expect("Should return valid path").path;
         assert_eq!(actual.as_ref(), expected);
     }
@@ -3341,14 +3352,22 @@ mod tests {
             })
             .await;
 
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error {
+            error,
+            diff,
+            input_path,
+        } = result.unwrap_err()
+        else {
             panic!("expected error");
         };
+
         assert!(
             error.contains("has been modified since you last read it"),
             "Error should mention file modification, got: {}",
             error
         );
+        assert!(diff.is_empty());
+        assert!(input_path.is_none());
     }
 
     #[gpui::test]
@@ -3415,7 +3434,12 @@ mod tests {
             })
             .await;
 
-        let StreamingEditFileToolOutput::Error { error } = result.unwrap_err() else {
+        let StreamingEditFileToolOutput::Error {
+            error,
+            diff,
+            input_path,
+        } = result.unwrap_err()
+        else {
             panic!("expected error");
         };
         assert!(
@@ -3433,6 +3457,8 @@ mod tests {
             "Error should ask user to manually save or revert when tools aren't available, got: {}",
             error
         );
+        assert!(diff.is_empty());
+        assert!(input_path.is_none());
     }
 
     #[gpui::test]

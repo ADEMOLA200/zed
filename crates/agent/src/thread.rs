@@ -2441,7 +2441,7 @@ impl Thread {
             }));
         };
 
-        let tool_output = format!("Error parsing input JSON: {json_parse_error}");
+        let error_message = format!("Error parsing input JSON: {json_parse_error}");
 
         if tool.supports_input_streaming()
             && let Some(mut sender) = self
@@ -2450,14 +2450,12 @@ impl Thread {
                 .streaming_tool_inputs
                 .remove(&tool_use.id)
         {
-            sender.send(ToolInputPayload::InvalidJson {
-                error_message: tool_output.into(),
-            });
+            sender.send(ToolInputPayload::InvalidJson { error_message });
             return None;
         }
 
         log::debug!("Running tool {}. Received invalid JSON", tool_use.name);
-        let tool_input = ToolInput::invalid_json(tool_output.into());
+        let tool_input = ToolInput::invalid_json(error_message);
         Some(self.run_tool(
             tool,
             tool_input,
@@ -3167,7 +3165,7 @@ impl<T: DeserializeOwned> ToolInput<T> {
         }
     }
 
-    pub fn invalid_json(error_message: SharedString) -> Self {
+    pub fn invalid_json(error_message: String) -> Self {
         let (tx, rx) = mpsc::unbounded();
         tx.unbounded_send(ToolInputPayload::InvalidJson { error_message })
             .ok();
@@ -3257,12 +3255,12 @@ impl ToolInputSender {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn send_partial(&mut self, payload: serde_json::Value) {
+    pub fn send_partial(&mut self, payload: serde_json::Value) {
         self.send(ToolInputPayload::Partial(payload))
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn send_full(&mut self, payload: serde_json::Value) {
+    pub fn send_full(&mut self, payload: serde_json::Value) {
         self.send(ToolInputPayload::Full(payload))
     }
 
@@ -4320,68 +4318,78 @@ mod tests {
     ) {
         let (thread, event_stream) = setup_thread_for_test(cx).await;
 
-        cx.update(|cx| {
-            thread.update(cx, |thread, _cx| {
-                let tool_use_id = LanguageModelToolUseId::from("test_tool_id");
-                let tool_name: Arc<str> = Arc::from("test_tool");
-                let raw_input: Arc<str> = Arc::from("{invalid json");
-                let json_parse_error = "expected value at line 1 column 1".to_string();
+        let tool_use_id = LanguageModelToolUseId::from("test_tool_id");
+        let tool_name: Arc<str> = Arc::from("test_tool");
+        let raw_input: Arc<str> = Arc::from("{invalid json");
+        let json_parse_error = "expected value at line 1 column 1".to_string();
 
-                // Call the function under test
-                let result = thread.handle_tool_use_json_parse_error_event(
-                    tool_use_id.clone(),
-                    tool_name.clone(),
-                    raw_input.clone(),
-                    json_parse_error,
-                    &event_stream,
-                );
+        let (_cancellation_tx, cancellation_rx) = watch::channel(false);
 
-                // Verify the result is an error
-                assert!(result.is_error);
-                assert_eq!(result.tool_use_id, tool_use_id);
-                assert_eq!(result.tool_name, tool_name);
-                assert!(matches!(
-                    result.content,
-                    LanguageModelToolResultContent::Text(_)
-                ));
+        let result = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    // Call the function under test
+                    thread
+                        .handle_tool_use_json_parse_error_event(
+                            tool_use_id.clone(),
+                            tool_name.clone(),
+                            raw_input.clone(),
+                            json_parse_error,
+                            &event_stream,
+                            cancellation_rx,
+                            cx,
+                        )
+                        .unwrap()
+                })
+            })
+            .await;
 
-                // Verify the tool use was added to the message content
-                {
-                    let last_message = thread.pending_message();
-                    assert_eq!(
-                        last_message.content.len(),
-                        1,
-                        "Should have one tool_use in content"
-                    );
+        // Verify the result is an error
+        assert!(result.is_error);
+        assert_eq!(result.tool_use_id, tool_use_id);
+        assert_eq!(result.tool_name, tool_name);
+        assert!(matches!(
+            result.content,
+            LanguageModelToolResultContent::Text(_)
+        ));
 
-                    match &last_message.content[0] {
-                        AgentMessageContent::ToolUse(tool_use) => {
-                            assert_eq!(tool_use.id, tool_use_id);
-                            assert_eq!(tool_use.name, tool_name);
-                            assert_eq!(tool_use.raw_input, raw_input.to_string());
-                            assert!(tool_use.is_input_complete);
-                            // Should fall back to empty object for invalid JSON
-                            assert_eq!(tool_use.input, json!({}));
-                        }
-                        _ => panic!("Expected ToolUse content"),
-                    }
-                }
-
-                // Insert the tool result (simulating what the caller does)
-                thread
-                    .pending_message()
-                    .tool_results
-                    .insert(result.tool_use_id.clone(), result);
-
-                // Verify the tool result was added
+        thread.update(cx, |thread, _cx| {
+            // Verify the tool use was added to the message content
+            {
                 let last_message = thread.pending_message();
                 assert_eq!(
-                    last_message.tool_results.len(),
+                    last_message.content.len(),
                     1,
-                    "Should have one tool_result"
+                    "Should have one tool_use in content"
                 );
-                assert!(last_message.tool_results.contains_key(&tool_use_id));
-            });
-        });
+
+                match &last_message.content[0] {
+                    AgentMessageContent::ToolUse(tool_use) => {
+                        assert_eq!(tool_use.id, tool_use_id);
+                        assert_eq!(tool_use.name, tool_name);
+                        assert_eq!(tool_use.raw_input, raw_input.to_string());
+                        assert!(tool_use.is_input_complete);
+                        // Should fall back to empty object for invalid JSON
+                        assert_eq!(tool_use.input, json!({}));
+                    }
+                    _ => panic!("Expected ToolUse content"),
+                }
+            }
+
+            // Insert the tool result (simulating what the caller does)
+            thread
+                .pending_message()
+                .tool_results
+                .insert(result.tool_use_id.clone(), result);
+
+            // Verify the tool result was added
+            let last_message = thread.pending_message();
+            assert_eq!(
+                last_message.tool_results.len(),
+                1,
+                "Should have one tool_result"
+            );
+            assert!(last_message.tool_results.contains_key(&tool_use_id));
+        })
     }
 }

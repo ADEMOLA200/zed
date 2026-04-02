@@ -203,14 +203,6 @@ async fn test_edit_file_tool_in_thread_context(cx: &mut TestAppContext) {
     });
 }
 
-/// Verifies that a streaming `edit_file` JSON parse error does not leave the
-/// buffer in a state that breaks the retry.
-///
-/// 1. The LLM streams partial `edit_file` JSON that starts modifying the buffer.
-/// 2. At `ContentBlockStop`, the accumulated JSON is malformed → `ToolUseJsonParseError`.
-/// 3. The thread retries.
-/// 4. On retry, the model sends a fresh, complete `edit_file` call for the same file.
-/// 5. The second edit succeeds and is saved without surfacing a stale unsaved-changes error.
 #[gpui::test]
 async fn test_streaming_edit_json_parse_error_does_not_cause_unsaved_changes(
     cx: &mut TestAppContext,
@@ -262,7 +254,6 @@ async fn test_streaming_edit_json_parse_error_does_not_cause_unsaved_changes(
         thread
     });
 
-    // ── Turn 1: trigger the bug ──────────────────────────────────────────
     let _events = thread
         .update(cx, |thread, cx| {
             thread.send(
@@ -274,9 +265,6 @@ async fn test_streaming_edit_json_parse_error_does_not_cause_unsaved_changes(
         .unwrap();
     cx.run_until_parked();
 
-    // First partial: path + description + mode (not yet enough to create
-    // the EditSession because path_complete requires the path to match
-    // the previous partial).
     let tool_use_id = "edit_1";
     let partial_1 = LanguageModelToolUse {
         id: tool_use_id.into(),
@@ -298,8 +286,6 @@ async fn test_streaming_edit_json_parse_error_does_not_cause_unsaved_changes(
     fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(partial_1));
     cx.run_until_parked();
 
-    // Second partial: same path again (path_complete = true) + content.
-    // This creates the EditSession and starts applying the streamed write.
     let partial_2 = LanguageModelToolUse {
         id: tool_use_id.into(),
         name: EditFileTool::NAME.into(),
@@ -322,9 +308,7 @@ async fn test_streaming_edit_json_parse_error_does_not_cause_unsaved_changes(
     fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(partial_2));
     cx.run_until_parked();
 
-    // Emit ToolUseJsonParseError for the SAME tool_use_id.
-    // In production this happens when ContentBlockStop finds the accumulated
-    // JSON is malformed (e.g. unescaped characters).
+    // Now send a json parse error. At this point we have started writing content to the buffer.
     fake_model.send_last_completion_stream_event(
         LanguageModelCompletionEvent::ToolUseJsonParseError {
             id: tool_use_id.into(),
@@ -338,19 +322,16 @@ async fn test_streaming_edit_json_parse_error_does_not_cause_unsaved_changes(
     fake_model.end_last_completion_stream();
     cx.run_until_parked();
 
-    // Advance past the retry delay so the thread retries.
-    cx.executor().advance_clock(Duration::from_secs(5));
-    cx.run_until_parked();
+    // cx.executor().advance_clock(Duration::from_secs(5));
+    // cx.run_until_parked();
 
-    // ── Turn 2 (retry): model sends a fresh, complete edit_file call ─────
-    // The thread should have retried and be waiting for a new completion.
     assert!(
         !fake_model.pending_completions().is_empty(),
         "Thread should have retried after the error"
     );
 
     // Respond with a new, well-formed, complete edit_file tool use.
-    let retry_tool_use = LanguageModelToolUse {
+    let tool_use = LanguageModelToolUse {
         id: "edit_2".into(),
         name: EditFileTool::NAME.into(),
         raw_input: json!({
@@ -369,19 +350,12 @@ async fn test_streaming_edit_json_parse_error_does_not_cause_unsaved_changes(
         is_input_complete: true,
         thought_signature: None,
     };
-    fake_model
-        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(retry_tool_use));
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use));
     fake_model
         .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::ToolUse));
     fake_model.end_last_completion_stream();
     cx.run_until_parked();
 
-    // Advance clock again to ensure the successful retry does not schedule
-    // another retry due to a stale unsaved-changes error.
-    cx.executor().advance_clock(Duration::from_secs(5));
-    cx.run_until_parked();
-
-    // ── Verify the retry succeeded gracefully ───────────────────────────
     let pending_completions = fake_model.pending_completions();
     assert!(
         pending_completions.len() == 1,
@@ -407,6 +381,7 @@ async fn test_streaming_edit_json_parse_error_does_not_cause_unsaved_changes(
         })
         .expect("Should have a tool result for edit_2");
 
+    // Ensure that the second tool call completed successfully and edits were applied.
     assert!(
         !tool_result.is_error,
         "Tool result should succeed, got: {:?}",

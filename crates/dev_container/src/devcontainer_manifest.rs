@@ -2397,6 +2397,8 @@ mod test {
     use serde_json_lenient::Value;
     use util::{command::Command, paths::SanitizedPath};
 
+    #[cfg(not(target_os = "windows"))]
+    use crate::docker::DockerComposeServicePort;
     use crate::{
         DevContainerConfig, DevContainerContext,
         command_json::CommandRunner,
@@ -2408,8 +2410,8 @@ mod test {
         },
         docker::{
             DockerClient, DockerComposeConfig, DockerComposeService, DockerComposeServiceBuild,
-            DockerComposeServicePort, DockerComposeVolume, DockerConfigLabels, DockerInspectConfig,
-            DockerInspectMount, DockerPs,
+            DockerComposeVolume, DockerConfigLabels, DockerInspectConfig, DockerInspectMount,
+            DockerPs,
         },
         oci::TokenResponse,
     };

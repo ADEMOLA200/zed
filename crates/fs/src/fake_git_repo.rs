@@ -387,7 +387,7 @@ impl GitRepository for FakeGitRepository {
     fn branches(&self) -> BoxFuture<'_, Result<Vec<Branch>>> {
         self.with_state_async(false, move |state| {
             let current_branch = &state.current_branch_name;
-            Ok(state
+            let mut branches = state
                 .branches
                 .iter()
                 .map(|branch_name| {
@@ -405,7 +405,11 @@ impl GitRepository for FakeGitRepository {
                         upstream: None,
                     }
                 })
-                .collect())
+                .collect::<Vec<_>>();
+            // compute snapshot expects these to be sorted by ref_name
+            // because that's what git itself does
+            branches.sort_by(|a, b| a.ref_name.cmp(&b.ref_name));
+            Ok(branches)
         })
     }
 

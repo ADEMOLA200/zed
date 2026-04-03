@@ -1,5 +1,7 @@
 use crate::metrics::tokenize;
 
+const MAX_DIRTY_LENGTH_DELTA_CHARS: usize = 512;
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenAnnotation {
@@ -155,6 +157,12 @@ fn analyze_masked_tokens<'a>(tokens: &[&'a str], mask: &[bool]) -> (Vec<&'a str>
     (unmasked_tokens, unmasked_chars, masked_chars)
 }
 
+fn should_bail_for_dirty_final(base: &str, predicted: &str, final_text: &str) -> bool {
+    let predicted_delta_chars = predicted.len().abs_diff(base.len());
+    let final_delta_chars = final_text.len().abs_diff(base.len());
+    predicted_delta_chars.abs_diff(final_delta_chars) > MAX_DIRTY_LENGTH_DELTA_CHARS
+}
+
 pub fn compute_kept_rate(base: &str, predicted: &str, final_text: &str) -> KeptRateResult {
     if base == predicted && predicted == final_text {
         let predicted_tokens = tokenize(predicted);
@@ -168,6 +176,21 @@ pub fn compute_kept_rate(base: &str, predicted: &str, final_text: &str) -> KeptR
             kept_rate: 1.0,
             #[cfg(test)]
             token_annotations: vec![TokenAnnotation::Context; predicted_tokens.len()],
+        };
+    }
+
+    if should_bail_for_dirty_final(base, predicted, final_text) {
+        let predicted_new_chars = predicted.len().abs_diff(base.len());
+        let final_new_chars = final_text.len().abs_diff(base.len());
+        return KeptRateResult {
+            predicted_new_chars,
+            final_new_chars,
+            kept_chars: 0,
+            discarded_chars: predicted_new_chars,
+            context_chars: 0,
+            kept_rate: 0.0,
+            #[cfg(test)]
+            token_annotations: vec![TokenAnnotation::Discarded; tokenize(predicted).len()],
         };
     }
 
@@ -340,6 +363,21 @@ mod test_kept_rate {
         assert!(result.kept_chars > 0);
         assert!(result.discarded_chars > 0);
         assert!(result.kept_rate > 0.0 && result.kept_rate < 1.0);
+    }
+
+    #[test]
+    fn test_bails_for_dirty_final() {
+        let base = "fn example() {\n    work();\n}\n";
+        let predicted = "fn example() {\n    work();\n    predicted();\n}\n";
+        let final_text = format!(
+            "fn example() {{\n    work();\n    {}\n}}\n",
+            "settled();\n    ".repeat(MAX_DIRTY_LENGTH_DELTA_CHARS / 8 + 64)
+        );
+
+        let result = compute_kept_rate(base, predicted, &final_text);
+        assert_eq!(result.kept_rate, 0.0);
+        assert_eq!(result.kept_chars, 0);
+        assert_eq!(result.discarded_chars, result.predicted_new_chars);
     }
 
     #[test]

@@ -149,6 +149,8 @@ pub(crate) struct DockerComposeService {
     pub(crate) ports: Vec<DockerComposeServicePort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) network_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq, Default)]

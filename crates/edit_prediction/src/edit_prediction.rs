@@ -1608,84 +1608,100 @@ impl EditPredictionStore {
             };
 
             let now = cx.background_executor().now();
-
             let mut oldest_edited_at = None;
+            let mut ready_predictions = Vec::new();
 
             this.update(cx, |this, _| {
                 for (_, project_state) in this.projects.iter_mut() {
                     for (_, registered_buffer) in project_state.registered_buffers.iter_mut() {
-                        registered_buffer
-                            .pending_predictions
-                            .retain_mut(|pending_prediction| {
-                                let age =
-                                    now.saturating_duration_since(pending_prediction.enqueued_at);
-                                if age >= EDIT_PREDICTION_SETTLED_TTL {
-                                    return false;
-                                }
+                        let mut pending_index = 0;
+                        while pending_index < registered_buffer.pending_predictions.len() {
+                            let pending_prediction =
+                                &registered_buffer.pending_predictions[pending_index];
+                            let age = now.saturating_duration_since(pending_prediction.enqueued_at);
+                            if age >= EDIT_PREDICTION_SETTLED_TTL {
+                                registered_buffer.pending_predictions.remove(pending_index);
+                                continue;
+                            }
 
-                                let quiet_for =
-                                    now.saturating_duration_since(pending_prediction.last_edit_at);
-                                if quiet_for >= EDIT_PREDICTION_SETTLED_QUIESCENCE {
-                                    let settled_editable_region = registered_buffer
-                                        .snapshot
-                                        .text_for_range(
-                                            pending_prediction.editable_anchor_range.clone(),
-                                        )
-                                        .collect::<String>();
-                                    let kept_rate_result = compute_kept_rate(
-                                        &pending_prediction.editable_region_before_prediction,
-                                        &pending_prediction.predicted_editable_region,
-                                        &settled_editable_region,
-                                    );
+                            let quiet_for =
+                                now.saturating_duration_since(pending_prediction.last_edit_at);
+                            if quiet_for >= EDIT_PREDICTION_SETTLED_QUIESCENCE {
+                                let pending_prediction =
+                                    registered_buffer.pending_predictions.remove(pending_index);
+                                let settled_editable_region = registered_buffer
+                                    .snapshot
+                                    .text_for_range(
+                                        pending_prediction.editable_anchor_range.clone(),
+                                    )
+                                    .collect::<String>();
+                                ready_predictions
+                                    .push((pending_prediction, settled_editable_region));
+                                continue;
+                            }
 
-                                    #[cfg(test)]
-                                    if let Some(callback) = &this.settled_event_callback {
-                                        callback(
-                                            pending_prediction.request_id.clone(),
-                                            settled_editable_region.clone(),
-                                        );
-                                    }
-
-                                    telemetry::event!(
-                                        EDIT_PREDICTION_SETTLED_EVENT,
-                                        request_id = pending_prediction.request_id.0.clone(),
-                                        editable_region_before_prediction = pending_prediction
-                                            .editable_region_before_prediction
-                                            .clone(),
-                                        predicted_editable_region =
-                                            pending_prediction.predicted_editable_region.clone(),
-                                        settled_editable_region,
-                                        ts_error_count_before_prediction =
-                                            pending_prediction.ts_error_count_before_prediction,
-                                        ts_error_count_after_prediction =
-                                            pending_prediction.ts_error_count_after_prediction,
-                                        edit_bytes_predicted_new =
-                                            kept_rate_result.predicted_new_chars,
-                                        edit_bytes_final_new = kept_rate_result.final_new_chars,
-                                        edit_bytes_kept = kept_rate_result.kept_chars,
-                                        edit_bytes_discarded = kept_rate_result.discarded_chars,
-                                        edit_bytes_context = kept_rate_result.context_chars,
-                                        edit_bytes_kept_rate = kept_rate_result.kept_rate,
-                                        example = pending_prediction.example.take(),
-                                        e2e_latency = pending_prediction.e2e_latency.as_millis(),
-                                    );
-
-                                    return false;
-                                }
-
-                                if oldest_edited_at
-                                    .is_none_or(|t| pending_prediction.last_edit_at < t)
-                                {
-                                    oldest_edited_at = Some(pending_prediction.last_edit_at);
-                                }
-
-                                true
-                            });
+                            if oldest_edited_at
+                                .is_none_or(|time| pending_prediction.last_edit_at < time)
+                            {
+                                oldest_edited_at = Some(pending_prediction.last_edit_at);
+                            }
+                            pending_index += 1;
+                        }
                     }
                 }
             });
 
-            next_wake_time = oldest_edited_at.map(|t| t + EDIT_PREDICTION_SETTLED_QUIESCENCE);
+            for (pending_prediction, settled_editable_region) in ready_predictions {
+                let PendingSettledPrediction {
+                    request_id,
+                    editable_region_before_prediction,
+                    predicted_editable_region,
+                    ts_error_count_before_prediction,
+                    ts_error_count_after_prediction,
+                    example,
+                    e2e_latency,
+                    ..
+                } = pending_prediction;
+                let settled_editable_region_for_metrics = settled_editable_region.clone();
+                let kept_rate_result = cx
+                    .background_spawn(async move {
+                        compute_kept_rate(
+                            &editable_region_before_prediction,
+                            &predicted_editable_region,
+                            &settled_editable_region_for_metrics,
+                        )
+                    })
+                    .await;
+
+                #[cfg(test)]
+                {
+                    let request_id = request_id.clone();
+                    let settled_editable_region = settled_editable_region.clone();
+                    this.update(cx, |this, _| {
+                        if let Some(callback) = &this.settled_event_callback {
+                            callback(request_id, settled_editable_region);
+                        }
+                    });
+                }
+
+                telemetry::event!(
+                    EDIT_PREDICTION_SETTLED_EVENT,
+                    request_id = request_id.0.clone(),
+                    settled_editable_region,
+                    ts_error_count_before_prediction,
+                    ts_error_count_after_prediction,
+                    edit_bytes_predicted_new = kept_rate_result.predicted_new_chars,
+                    edit_bytes_final_new = kept_rate_result.final_new_chars,
+                    edit_bytes_kept = kept_rate_result.kept_chars,
+                    edit_bytes_discarded = kept_rate_result.discarded_chars,
+                    edit_bytes_context = kept_rate_result.context_chars,
+                    edit_bytes_kept_rate = kept_rate_result.kept_rate,
+                    example,
+                    e2e_latency = e2e_latency.as_millis(),
+                );
+            }
+
+            next_wake_time = oldest_edited_at.map(|time| time + EDIT_PREDICTION_SETTLED_QUIESCENCE);
         }
     }
 
@@ -1709,6 +1725,7 @@ impl EditPredictionStore {
         else {
             return;
         };
+
         let editable_region_before_prediction = edited_buffer_snapshot
             .text_for_range(editable_offset_range.clone())
             .collect::<String>();

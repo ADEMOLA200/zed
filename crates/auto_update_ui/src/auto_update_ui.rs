@@ -228,6 +228,7 @@ impl Render for AnnouncementToastNotification {
             .primary_action_label(self.content.primary_action_label.clone())
             .primary_on_click(cx.listener({
                 let url = self.content.primary_action_url.clone();
+                telemetry::event!("Parallel Agent Announcement Main Click");
                 move |_, _, _window, cx| {
                     if let Some(url) = &url {
                         cx.open_url(url);
@@ -237,6 +238,7 @@ impl Render for AnnouncementToastNotification {
             }))
             .secondary_on_click(cx.listener({
                 let url = self.content.primary_action_url.clone();
+                telemetry::event!("Parallel Agent Announcement Secondary Click");
                 move |_, _, _window, cx| {
                     if let Some(url) = &url {
                         cx.open_url(url);
@@ -245,6 +247,7 @@ impl Render for AnnouncementToastNotification {
                 }
             }))
             .dismiss_on_click(cx.listener(|_, _, _window, cx| {
+                telemetry::event!("Parallel Agent Announcement Dismiss");
                 cx.emit(DismissEvent);
             }))
     }

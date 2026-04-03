@@ -487,6 +487,7 @@ impl Render for AgentLayoutOnboarding {
                             .label_size(LabelSize::Small)
                             .on_click({
                                 let dismiss = self.dismissed.clone();
+                                telemetry::event!("Agentic Layout Onboarding Dismissed");
                                 move |_, window, cx| dismiss(window, cx)
                             }),
                     )
@@ -497,6 +498,7 @@ impl Render for AgentLayoutOnboarding {
                             .on_click({
                                 let use_layout = self.use_agent_layout.clone();
                                 let dismiss = self.dismissed.clone();
+                                telemetry::event!("Use New Agentic Layout");
                                 move |_, window, cx| {
                                     use_layout(window, cx);
                                     dismiss(window, cx);

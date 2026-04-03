@@ -375,11 +375,7 @@ impl Component for ZedAiOnboarding {
     }
 
     fn name() -> &'static str {
-        "Agent Panel Banners"
-    }
-
-    fn sort_name() -> &'static str {
-        "Agent Panel Banners"
+        "Agent New User Onboarding"
     }
 
     fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
@@ -462,7 +458,7 @@ impl Render for AgentLayoutOnboarding {
             .w_full()
             .relative()
             .gap_1()
-            .child(Headline::new("A new workspace layout for agentic work"))
+            .child(Label::new("A new workspace layout for agentic work"))
             .child(Label::new(description).color(Color::Muted).mb_2())
             .child(
                 List::new()

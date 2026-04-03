@@ -1175,6 +1175,136 @@ mod git_traversal {
     }
 }
 
+mod git_graph_tests {
+    use std::{path::Path, sync::Arc};
+
+    use crate::Project;
+    use fs::FakeFs;
+    use git::{
+        Oid,
+        repository::{InitialGraphCommitData, LogOrder, LogSource},
+        stash::{GitStash, StashEntry},
+    };
+    use gpui::TestAppContext;
+    use project::git_store::GraphDataResponse;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+
+    fn init_test(cx: &mut gpui::TestAppContext) {
+        zlog::init_test();
+
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    fn oid(byte: u8) -> Oid {
+        Oid::from_bytes(&[byte; 20]).unwrap()
+    }
+
+    fn commit(sha: Oid, parents: &[Oid], ref_names: &[&str]) -> Arc<InitialGraphCommitData> {
+        Arc::new(InitialGraphCommitData {
+            sha,
+            parents: parents.iter().copied().collect(),
+            ref_names: ref_names
+                .iter()
+                .map(|name| name.to_string().into())
+                .collect(),
+        })
+    }
+
+    fn stash_entry(index: usize, oid: Oid, branch: &str, message: &str) -> StashEntry {
+        StashEntry {
+            index,
+            oid,
+            message: message.to_string(),
+            branch: Some(branch.to_string()),
+            timestamp: 1,
+        }
+    }
+
+    fn graph_shas(response: GraphDataResponse<'_>) -> Vec<Oid> {
+        response.commits.iter().map(|commit| commit.sha).collect()
+    }
+
+    #[gpui::test]
+    async fn test_stash_change_should_invalidate_all_graph_cache(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {},
+                "a.txt": "hello",
+            }),
+        )
+        .await;
+
+        let initial_head = oid(1);
+        let initial_stash = oid(2);
+        let updated_head = oid(3);
+        let updated_stash = oid(4);
+
+        fs.with_git_state(Path::new(path!("/root/.git")), true, |state| {
+            state.graph_commits = vec![
+                commit(initial_head, &[initial_stash], &["HEAD", "refs/heads/main"]),
+                commit(initial_stash, &[], &["refs/stash"]),
+            ];
+            state.stash_entries = GitStash {
+                entries: vec![stash_entry(0, initial_stash, "main", "initial stash")].into(),
+            };
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+
+        let initial_graph = cx.update(|cx| {
+            repository.update(cx, |repository, cx| {
+                graph_shas(repository.graph_data(LogSource::All, LogOrder::DateOrder, 0..10, cx))
+            })
+        });
+        assert!(initial_graph.is_empty());
+
+        cx.run_until_parked();
+
+        let initial_graph = cx.update(|cx| {
+            repository.update(cx, |repository, cx| {
+                graph_shas(repository.graph_data(LogSource::All, LogOrder::DateOrder, 0..10, cx))
+            })
+        });
+        assert_eq!(initial_graph, vec![initial_head, initial_stash]);
+
+        fs.with_git_state(Path::new(path!("/root/.git")), true, |state| {
+            state.graph_commits = vec![
+                commit(updated_head, &[updated_stash], &["HEAD", "refs/heads/main"]),
+                commit(updated_stash, &[], &["refs/stash"]),
+            ];
+            state.stash_entries = GitStash {
+                entries: vec![stash_entry(0, updated_stash, "main", "updated stash")].into(),
+            };
+        })
+        .unwrap();
+
+        cx.run_until_parked();
+
+        let reloaded_graph = cx.update(|cx| {
+            repository.update(cx, |repository, cx| {
+                graph_shas(repository.graph_data(LogSource::All, LogOrder::DateOrder, 0..10, cx))
+            })
+        });
+
+        assert_eq!(reloaded_graph, vec![updated_head, updated_stash]);
+    }
+}
+
 mod git_worktrees {
     use fs::FakeFs;
     use gpui::TestAppContext;

@@ -10,6 +10,7 @@ use git::{
         GRAPH_CHUNK_SIZE, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
         LogSource, PushOptions, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
     },
+    stash::GitStash,
     status::{
         DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus,
         UnmergedStatus,
@@ -53,6 +54,7 @@ pub struct FakeGitRepositoryState {
     pub simulated_create_worktree_error: Option<String>,
     pub refs: HashMap<String, String>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
+    pub stash_entries: GitStash,
 }
 
 impl FakeGitRepositoryState {
@@ -72,6 +74,7 @@ impl FakeGitRepositoryState {
             oids: Default::default(),
             remotes: HashMap::default(),
             graph_commits: Vec::new(),
+            stash_entries: Default::default(),
         }
     }
 }
@@ -378,7 +381,7 @@ impl GitRepository for FakeGitRepository {
     }
 
     fn stash_entries(&self) -> BoxFuture<'_, Result<git::stash::GitStash>> {
-        async { Ok(git::stash::GitStash::default()) }.boxed()
+        self.with_state_async(false, |state| Ok(state.stash_entries.clone()))
     }
 
     fn branches(&self) -> BoxFuture<'_, Result<Vec<Branch>>> {

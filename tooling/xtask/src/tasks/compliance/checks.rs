@@ -208,7 +208,7 @@ impl Reporter {
             .github_client
             .get_pr_reviews(pull_request.number)
             .await?
-            .take_items();
+            .collect_vec();
 
         if !pr_reviews.is_empty() {
             let mut org_approving_reviews = Vec::new();
@@ -245,7 +245,7 @@ impl Reporter {
             .github_client
             .get_pr_comments(pull_request.number)
             .await?
-            .take_items();
+            .collect_vec();
 
         if !other_comments.is_empty() {
             let mut org_approving_comments = Vec::new();

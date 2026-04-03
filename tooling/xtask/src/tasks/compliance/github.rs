@@ -1,28 +1,29 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    ops::Not,
-};
+use std::{collections::HashMap, fmt, ops::Not};
 
 use anyhow::{Context, Result};
 use derive_more::Deref;
+use futures_util::TryStreamExt as _;
 use itertools::Itertools;
 use jsonwebtoken::EncodingKey;
 use octocrab::{
     Octocrab, Page,
-    models::pulls::{PullRequest, Review},
+    models::{
+        issues,
+        pulls::{PullRequest, Review},
+    },
+    service::middleware::cache::mem::InMemoryCache,
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
+use tokio::pin;
 
 use crate::tasks::compliance::git::CommitSha;
 
-const PAGE_SIZE: u8 = 64;
+const PAGE_SIZE: u8 = 100;
 const ORG: &str = "zed-industries";
 const REPO: &str = "zed";
 
 pub struct GitHubClient {
     client: Octocrab,
-    organization_members: Option<HashSet<String>>,
 }
 
 #[derive(Debug, Deserialize, Clone, Deref, PartialEq, Eq)]
@@ -97,8 +98,7 @@ pub(crate) struct AuthorsForCommits(HashMap<CommitSha, CommitAuthors>);
 impl GitHubClient {
     pub async fn for_app(app_id: u64, app_private_key: &str) -> Result<Self> {
         let octocrab = Octocrab::builder()
-            // TODO! check
-            // .cache(InMemoryCache::new())
+            .cache(InMemoryCache::new())
             .app(
                 app_id.into(),
                 EncodingKey::from_rsa_pem(app_private_key.as_bytes())?,
@@ -126,10 +126,7 @@ impl GitHubClient {
     }
 
     fn new(client: Octocrab) -> Self {
-        Self {
-            client,
-            organization_members: None,
-        }
+        Self { client }
     }
 
     fn build_co_authors_query<'a>(shas: impl IntoIterator<Item = &'a CommitSha>) -> String {
@@ -210,59 +207,76 @@ impl GitHubClient {
         self.client.pulls(ORG, REPO).get(pr_number).await
     }
 
-    pub async fn get_pr_reviews(&self, pr_number: u64) -> octocrab::Result<Page<Review>> {
-        // TODO! pagination
-        self.client
-            .pulls(ORG, REPO)
-            .list_reviews(pr_number)
-            .per_page(PAGE_SIZE)
-            .send()
-            .await
+    pub async fn get_pr_reviews(
+        &self,
+        pr_number: u64,
+    ) -> octocrab::Result<impl Iterator<Item = Review>> {
+        self.get_all(
+            self.client
+                .pulls(ORG, REPO)
+                .list_reviews(pr_number)
+                .per_page(PAGE_SIZE)
+                .send()
+                .await?,
+        )
+        .await
     }
 
     pub async fn get_pr_comments(
         &self,
         pr_number: u64,
-    ) -> octocrab::Result<Page<octocrab::models::issues::Comment>> {
-        self.client
-            .issues(ORG, REPO)
-            .list_comments(pr_number)
-            .per_page(PAGE_SIZE)
-            .send()
-            .await
+    ) -> octocrab::Result<impl Iterator<Item = issues::Comment>> {
+        self.get_all(
+            self.client
+                .issues(ORG, REPO)
+                .list_comments(pr_number)
+                .per_page(PAGE_SIZE)
+                .send()
+                .await?,
+        )
+        .await
     }
 
     pub async fn check_org_membership(&mut self, login: &GithubLogin) -> octocrab::Result<bool> {
-        let members = match self.organization_members.as_ref() {
-            Some(members) => members,
-            None => {
-                let mut fetched_members = HashSet::new();
-                let mut page: u32 = 1;
-                loop {
-                    let mut res = self
-                        .client
-                        .orgs(ORG)
-                        .list_members()
-                        .page(page)
-                        .per_page(PAGE_SIZE)
-                        .send()
-                        .await?;
+        self.get_all(
+            self.client
+                .orgs(ORG)
+                .list_members()
+                .per_page(PAGE_SIZE)
+                .send()
+                .await?,
+        )
+        .await
+        .map(|members| {
+            members
+                .map(|member| member.login)
+                .any(|member_login| member_login == login.as_str())
+        })
+    }
 
-                    fetched_members.extend(res.take_items().into_iter().map(|member| member.login));
+    async fn get_all<T: DeserializeOwned + 'static>(
+        &self,
+        page: Page<T>,
+    ) -> octocrab::Result<impl Iterator<Item = T>> {
+        self.get_filtered(page, |_| true).await
+    }
 
-                    if res.incomplete_results == Some(true) || res.next.is_some() {
-                        page += 1;
-                    } else {
-                        break;
-                    }
-                }
+    async fn get_filtered<T: DeserializeOwned + 'static>(
+        &self,
+        page: Page<T>,
+        predicate: fn(&T) -> bool,
+    ) -> octocrab::Result<impl Iterator<Item = T>> {
+        let stream = page.into_stream(&self.client);
+        pin!(stream);
 
-                log::info!("Found {} organization members", fetched_members.len());
+        let mut results = Vec::new();
 
-                self.organization_members.insert(fetched_members)
-            }
-        };
+        while let Some(item) = stream.try_next().await?
+            && predicate(&item)
+        {
+            results.push(item);
+        }
 
-        Ok(members.contains(login.as_str()))
+        Ok(results.into_iter())
     }
 }

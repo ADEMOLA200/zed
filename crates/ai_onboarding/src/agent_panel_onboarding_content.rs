@@ -13,7 +13,6 @@ pub struct AgentPanelOnboarding {
     client: Arc<Client>,
     has_configured_providers: bool,
     continue_with_zed_ai: Arc<dyn Fn(&mut Window, &mut App)>,
-    use_agent_layout: Option<Arc<dyn Fn(&mut Window, &mut App)>>,
 }
 
 impl AgentPanelOnboarding {
@@ -42,12 +41,7 @@ impl AgentPanelOnboarding {
             client,
             has_configured_providers: Self::has_configured_providers(cx),
             continue_with_zed_ai: Arc::new(continue_with_zed_ai),
-            use_agent_layout: None,
         }
-    }
-
-    pub fn set_use_agent_layout(&mut self, callback: impl Fn(&mut Window, &mut App) + 'static) {
-        self.use_agent_layout = Some(Arc::new(callback));
     }
 
     fn has_configured_providers(cx: &App) -> bool {
@@ -72,7 +66,7 @@ impl Render for AgentPanelOnboarding {
             .plan()
             .is_some_and(|plan| plan == Plan::ZedPro);
 
-        let mut onboarding = ZedAiOnboarding::new(
+        let onboarding = ZedAiOnboarding::new(
             self.client.clone(),
             &self.user_store,
             self.continue_with_zed_ai.clone(),
@@ -82,8 +76,6 @@ impl Render for AgentPanelOnboarding {
             let callback = self.continue_with_zed_ai.clone();
             move |window, cx| callback(window, cx)
         });
-
-        onboarding.use_agent_layout = self.use_agent_layout.clone();
 
         AgentPanelOnboardingCard::new()
             .child(onboarding)

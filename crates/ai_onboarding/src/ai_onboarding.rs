@@ -45,11 +45,9 @@ pub struct ZedAiOnboarding {
     pub sign_in_status: SignInStatus,
     pub plan: Option<Plan>,
     pub account_too_young: bool,
-    pub is_agent_layout_version: bool,
     pub continue_with_zed_ai: Arc<dyn Fn(&mut Window, &mut App)>,
     pub sign_in: Arc<dyn Fn(&mut Window, &mut App)>,
     pub dismiss_onboarding: Option<Arc<dyn Fn(&mut Window, &mut App)>>,
-    pub use_agent_layout: Option<Arc<dyn Fn(&mut Window, &mut App)>>,
 }
 
 impl ZedAiOnboarding {
@@ -66,7 +64,6 @@ impl ZedAiOnboarding {
             sign_in_status: status.into(),
             plan: store.plan(),
             account_too_young: store.account_too_young(),
-            is_agent_layout_version: true,
             continue_with_zed_ai,
             sign_in: Arc::new(move |_window, cx| {
                 cx.spawn({
@@ -76,7 +73,6 @@ impl ZedAiOnboarding {
                 .detach_and_log_err(cx);
             }),
             dismiss_onboarding: None,
-            use_agent_layout: None,
         }
     }
 
@@ -354,70 +350,11 @@ impl ZedAiOnboarding {
             .children(self.render_dismiss_button())
             .into_any_element()
     }
-
-    fn render_agent_layout(&self, _cx: &mut App) -> AnyElement {
-        let description = "Introducing a threads sidebar, positioned in the far left of your workspace, that allows you to manage agents across many projects. Your agent thread lives right to the side of it, and all other panels move to the right.";
-
-        v_flex()
-            .min_w_0()
-            .w_full()
-            .relative()
-            .gap_1()
-            .child(Headline::new("A new workspace layout for agentic work"))
-            .child(Label::new(description).color(Color::Muted).mb_2())
-            .child(
-                List::new()
-                    .child(ListBulletItem::new(
-                        "Use your favorite agents and run them in parallel",
-                    ))
-                    .child(ListBulletItem::new(
-                        "Isolate agents from each other using worktrees",
-                    ))
-                    .child(ListBulletItem::new(
-                        "Combine multiple projects in one window",
-                    )),
-            )
-            .children(self.render_dismiss_button())
-            .child({
-                let dismiss = self.dismiss_onboarding.clone();
-                let dismiss_for_layout = self.dismiss_onboarding.clone();
-                let use_layout = self.use_agent_layout.clone();
-
-                h_flex()
-                    .w_full()
-                    .gap_1()
-                    .flex_wrap()
-                    .justify_end()
-                    .child(
-                        Button::new("old_default", "Maybe Later")
-                            .label_size(LabelSize::Small)
-                            .when_some(dismiss, |button, callback| {
-                                button.on_click(move |_, window, cx| callback(window, cx))
-                            }),
-                    )
-                    .child(
-                        Button::new("start", "Use New Layout")
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Outlined)
-                            .when_some(use_layout, |button, callback| {
-                                button.on_click(move |_, window, cx| {
-                                    callback(window, cx);
-                                    if let Some(dismiss) = &dismiss_for_layout {
-                                        dismiss(window, cx);
-                                    }
-                                })
-                            }),
-                    )
-            })
-            .into_any_element()
-    }
 }
 
 impl RenderOnce for ZedAiOnboarding {
     fn render(self, _window: &mut ui::Window, cx: &mut App) -> impl IntoElement {
-        if self.is_agent_layout_version {
-            self.render_agent_layout(cx)
-        } else if matches!(self.sign_in_status, SignInStatus::SignedIn) {
+        if matches!(self.sign_in_status, SignInStatus::SignedIn) {
             match self.plan {
                 None => self.render_free_plan_state(cx),
                 Some(Plan::ZedFree) => self.render_free_plan_state(cx),
@@ -461,11 +398,9 @@ impl Component for ZedAiOnboarding {
                             sign_in_status,
                             plan,
                             account_too_young,
-                            is_agent_layout_version: false,
                             continue_with_zed_ai: Arc::new(|_, _| {}),
                             sign_in: Arc::new(|_, _| {}),
                             dismiss_onboarding: None,
-                            use_agent_layout: None,
                         }
                         .into_any_element(),
                     ),
@@ -506,29 +441,102 @@ impl Component for ZedAiOnboarding {
                         "Student Plan",
                         onboarding(SignInStatus::SignedIn, Some(Plan::ZedStudent), false),
                     ),
-                    single_example("Agent Layout", {
-                        div()
-                            .w_full()
-                            .min_w_40()
-                            .max_w(px(1100.))
-                            .child(
-                                AgentPanelOnboardingCard::new().child(
-                                    ZedAiOnboarding {
-                                        sign_in_status: SignInStatus::SignedIn,
-                                        plan: Some(Plan::ZedPro),
-                                        account_too_young: false,
-                                        is_agent_layout_version: true,
-                                        continue_with_zed_ai: Arc::new(|_, _| {}),
-                                        sign_in: Arc::new(|_, _| {}),
-                                        dismiss_onboarding: None,
-                                        use_agent_layout: None,
-                                    }
-                                    .into_any_element(),
-                                ),
-                            )
-                            .into_any_element()
-                    }),
                 ])
+                .into_any_element(),
+        )
+    }
+}
+
+#[derive(RegisterComponent)]
+pub struct AgentLayoutOnboarding {
+    pub use_agent_layout: Arc<dyn Fn(&mut Window, &mut App)>,
+    pub dismissed: Arc<dyn Fn(&mut Window, &mut App)>,
+}
+
+impl Render for AgentLayoutOnboarding {
+    fn render(&mut self, _window: &mut ui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let description = "Introducing a threads sidebar, positioned in the far left of your workspace, that allows you to manage agents across many projects. Your agent thread lives right to the side of it, and all other panels move to the right.";
+
+        let content = v_flex()
+            .min_w_0()
+            .w_full()
+            .relative()
+            .gap_1()
+            .child(Headline::new("A new workspace layout for agentic work"))
+            .child(Label::new(description).color(Color::Muted).mb_2())
+            .child(
+                List::new()
+                    .child(ListBulletItem::new(
+                        "Use your favorite agents and run them in parallel",
+                    ))
+                    .child(ListBulletItem::new(
+                        "Isolate agents from each other using worktrees",
+                    ))
+                    .child(ListBulletItem::new(
+                        "Combine multiple projects in one window",
+                    )),
+            )
+            .child({
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .flex_wrap()
+                    .justify_end()
+                    .child(
+                        Button::new("old_default", "Maybe Later")
+                            .label_size(LabelSize::Small)
+                            .on_click({
+                                let dismiss = self.dismissed.clone();
+                                move |_, window, cx| dismiss(window, cx)
+                            }),
+                    )
+                    .child(
+                        Button::new("start", "Use New Layout")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Outlined)
+                            .on_click({
+                                let use_layout = self.use_agent_layout.clone();
+                                let dismiss = self.dismissed.clone();
+                                move |_, window, cx| {
+                                    use_layout(window, cx);
+                                    dismiss(window, cx);
+                                }
+                            }),
+                    )
+            });
+
+        AgentPanelOnboardingCard::new().child(content)
+    }
+}
+
+impl Component for AgentLayoutOnboarding {
+    fn scope() -> ComponentScope {
+        ComponentScope::Onboarding
+    }
+
+    fn name() -> &'static str {
+        "Agent Layout Onboarding"
+    }
+
+    fn preview(_window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+        let onboarding = cx.new(|_cx| AgentLayoutOnboarding {
+            use_agent_layout: Arc::new(|_, _| {}),
+            dismissed: Arc::new(|_, _| {}),
+        });
+
+        Some(
+            v_flex()
+                .min_w_0()
+                .gap_4()
+                .child(single_example(
+                    "Agent Layout Onboarding",
+                    div()
+                        .w_full()
+                        .min_w_40()
+                        .max_w(px(1100.))
+                        .child(onboarding)
+                        .into_any_element(),
+                ))
                 .into_any_element(),
         )
     }

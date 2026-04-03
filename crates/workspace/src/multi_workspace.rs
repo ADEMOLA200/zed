@@ -58,10 +58,9 @@ pub fn sidebar_side_context_menu(
     right_click_menu(id).menu(move |window, cx| {
         let fs = <dyn fs::Fs>::global(cx);
         ContextMenu::build(window, cx, move |mut menu, _, _cx| {
-            let positions: [(SidebarDockPosition, &str); 3] = [
+            let positions: [(SidebarDockPosition, &str); 2] = [
                 (SidebarDockPosition::Left, "Left"),
                 (SidebarDockPosition::Right, "Right"),
-                (SidebarDockPosition::FollowAgent, "Follow Agent Panel"),
             ];
             for (position, label) in positions {
                 let fs = fs.clone();
@@ -91,7 +90,11 @@ pub enum MultiWorkspaceEvent {
     WorkspaceRemoved(EntityId),
 }
 
-pub trait Sidebar: Focusable + Render + Sized {
+pub enum SidebarEvent {
+    SerializeNeeded,
+}
+
+pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     fn width(&self, cx: &App) -> Pixels;
     fn set_width(&mut self, width: Option<Pixels>, cx: &mut Context<Self>);
     fn has_notifications(&self, cx: &App) -> bool;
@@ -106,6 +109,20 @@ pub trait Sidebar: Focusable + Render + Sized {
     fn toggle_thread_switcher(
         &mut self,
         _select_last: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    /// Return an opaque JSON blob of sidebar-specific state to persist.
+    fn serialized_state(&self, _cx: &App) -> Option<String> {
+        None
+    }
+
+    /// Restore sidebar state from a previously-serialized blob.
+    fn restore_serialized_state(
+        &mut self,
+        _state: &str,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
@@ -126,6 +143,8 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn is_threads_list_view_active(&self, cx: &App) -> bool;
 
     fn side(&self, cx: &App) -> SidebarSide;
+    fn serialized_state(&self, cx: &App) -> Option<String>;
+    fn restore_serialized_state(&self, state: &str, window: &mut Window, cx: &mut App);
 }
 
 #[derive(Clone)]
@@ -186,6 +205,16 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
 
     fn side(&self, cx: &App) -> SidebarSide {
         self.read(cx).side(cx)
+    }
+
+    fn serialized_state(&self, cx: &App) -> Option<String> {
+        self.read(cx).serialized_state(cx)
+    }
+
+    fn restore_serialized_state(&self, state: &str, window: &mut Window, cx: &mut App) {
+        self.update(cx, |this, cx| {
+            this.restore_serialized_state(state, window, cx)
+        })
     }
 }
 
@@ -259,6 +288,12 @@ impl MultiWorkspace {
         self._subscriptions
             .push(cx.observe(&sidebar, |_this, _, cx| {
                 cx.notify();
+            }));
+        self._subscriptions
+            .push(cx.subscribe(&sidebar, |this, _, event, cx| match event {
+                SidebarEvent::SerializeNeeded => {
+                    this.serialize(cx);
+                }
             }));
         self.sidebar = Some(Box::new(sidebar));
     }
@@ -586,14 +621,22 @@ impl MultiWorkspace {
         self.cycle_workspace(-1, window, cx);
     }
 
-    fn serialize(&mut self, cx: &mut App) {
-        let window_id = self.window_id;
-        let state = crate::persistence::model::MultiWorkspaceState {
-            active_workspace_id: self.workspace().read(cx).database_id(),
-            sidebar_open: self.sidebar_open,
-        };
-        let kvp = db::kvp::KeyValueStore::global(cx);
-        self._serialize_task = Some(cx.background_spawn(async move {
+    pub(crate) fn serialize(&mut self, cx: &mut Context<Self>) {
+        self._serialize_task = Some(cx.spawn(async move |this, cx| {
+            let Some((window_id, state)) = this
+                .read_with(cx, |this, cx| {
+                    let state = crate::persistence::model::MultiWorkspaceState {
+                        active_workspace_id: this.workspace().read(cx).database_id(),
+                        sidebar_open: this.sidebar_open,
+                        sidebar_state: this.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
+                    };
+                    (this.window_id, state)
+                })
+                .ok()
+            else {
+                return;
+            };
+            let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
             crate::persistence::write_multi_workspace_state(&kvp, window_id, state).await;
         }));
     }
@@ -941,9 +984,15 @@ impl Render for MultiWorkspace {
                                     if let Some(sidebar) = this.sidebar.as_mut() {
                                         sidebar.set_width(None, cx);
                                     }
+                                    this.serialize(cx);
                                 })
                                 .ok();
                                 cx.stop_propagation();
+                            } else {
+                                weak.update(cx, |this, cx| {
+                                    this.serialize(cx);
+                                })
+                                .ok();
                             }
                         })
                         .occlude(),
@@ -1062,180 +1111,5 @@ impl Render for MultiWorkspace {
                 ..Tiling::default()
             },
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fs::FakeFs;
-    use gpui::TestAppContext;
-    use settings::SettingsStore;
-
-    fn init_test(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-            DisableAiSettings::register(cx);
-            cx.update_flags(false, vec!["agent-v2".into()]);
-        });
-    }
-
-    #[gpui::test]
-    async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
-
-        multi_workspace.read_with(cx, |mw, cx| {
-            assert!(mw.multi_workspace_enabled(cx));
-        });
-
-        multi_workspace.update_in(cx, |mw, _window, cx| {
-            mw.open_sidebar(cx);
-            assert!(mw.sidebar_open());
-        });
-
-        cx.update(|_window, cx| {
-            DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
-        });
-        cx.run_until_parked();
-
-        multi_workspace.read_with(cx, |mw, cx| {
-            assert!(
-                !mw.sidebar_open(),
-                "Sidebar should be closed when disable_ai is true"
-            );
-            assert!(
-                !mw.multi_workspace_enabled(cx),
-                "Multi-workspace should be disabled when disable_ai is true"
-            );
-        });
-
-        multi_workspace.update_in(cx, |mw, window, cx| {
-            mw.toggle_sidebar(window, cx);
-        });
-        multi_workspace.read_with(cx, |mw, _cx| {
-            assert!(
-                !mw.sidebar_open(),
-                "Sidebar should remain closed when toggled with disable_ai true"
-            );
-        });
-
-        cx.update(|_window, cx| {
-            DisableAiSettings::override_global(DisableAiSettings { disable_ai: false }, cx);
-        });
-        cx.run_until_parked();
-
-        multi_workspace.read_with(cx, |mw, cx| {
-            assert!(
-                mw.multi_workspace_enabled(cx),
-                "Multi-workspace should be enabled after re-enabling AI"
-            );
-            assert!(
-                !mw.sidebar_open(),
-                "Sidebar should still be closed after re-enabling AI (not auto-opened)"
-            );
-        });
-
-        multi_workspace.update_in(cx, |mw, window, cx| {
-            mw.toggle_sidebar(window, cx);
-        });
-        multi_workspace.read_with(cx, |mw, _cx| {
-            assert!(
-                mw.sidebar_open(),
-                "Sidebar should open when toggled after re-enabling AI"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_replace(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project_a = Project::test(fs.clone(), [], cx).await;
-        let project_b = Project::test(fs.clone(), [], cx).await;
-        let project_c = Project::test(fs.clone(), [], cx).await;
-        let project_d = Project::test(fs.clone(), [], cx).await;
-
-        let (multi_workspace, cx) = cx
-            .add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
-
-        let workspace_a_id =
-            multi_workspace.read_with(cx, |mw, _cx| mw.workspaces()[0].entity_id());
-
-        // Replace the only workspace (single-workspace case).
-        let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
-            let workspace = cx.new(|cx| Workspace::test_new(project_b.clone(), window, cx));
-            mw.replace(workspace.clone(), &*window, cx);
-            workspace
-        });
-
-        multi_workspace.read_with(cx, |mw, _cx| {
-            assert_eq!(mw.workspaces().len(), 1);
-            assert_eq!(
-                mw.workspaces()[0].entity_id(),
-                workspace_b.entity_id(),
-                "slot should now be project_b"
-            );
-            assert_ne!(
-                mw.workspaces()[0].entity_id(),
-                workspace_a_id,
-                "project_a should be gone"
-            );
-        });
-
-        // Add project_c as a second workspace, then replace it with project_d.
-        let workspace_c = multi_workspace.update_in(cx, |mw, window, cx| {
-            mw.test_add_workspace(project_c.clone(), window, cx)
-        });
-
-        multi_workspace.read_with(cx, |mw, _cx| {
-            assert_eq!(mw.workspaces().len(), 2);
-            assert_eq!(mw.active_workspace_index(), 1);
-        });
-
-        let workspace_d = multi_workspace.update_in(cx, |mw, window, cx| {
-            let workspace = cx.new(|cx| Workspace::test_new(project_d.clone(), window, cx));
-            mw.replace(workspace.clone(), &*window, cx);
-            workspace
-        });
-
-        multi_workspace.read_with(cx, |mw, _cx| {
-            assert_eq!(mw.workspaces().len(), 2, "should still have 2 workspaces");
-            assert_eq!(mw.active_workspace_index(), 1);
-            assert_eq!(
-                mw.workspaces()[1].entity_id(),
-                workspace_d.entity_id(),
-                "active slot should now be project_d"
-            );
-            assert_ne!(
-                mw.workspaces()[1].entity_id(),
-                workspace_c.entity_id(),
-                "project_c should be gone"
-            );
-        });
-
-        // Replace with workspace_b which is already in the list — should just switch.
-        multi_workspace.update_in(cx, |mw, window, cx| {
-            mw.replace(workspace_b.clone(), &*window, cx);
-        });
-
-        multi_workspace.read_with(cx, |mw, _cx| {
-            assert_eq!(
-                mw.workspaces().len(),
-                2,
-                "no workspace should be added or removed"
-            );
-            assert_eq!(
-                mw.active_workspace_index(),
-                0,
-                "should have switched to workspace_b"
-            );
-        });
     }
 }

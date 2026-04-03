@@ -4309,6 +4309,7 @@ chmod +x ./install.sh
         }))
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[gpui::test]
     async fn test_spawns_devcontainer_with_plain_image(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -4383,6 +4384,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[gpui::test]
     async fn test_spawns_devcontainer_with_docker_compose_and_plain_image(cx: &mut TestAppContext) {
         cx.executor().allow_parking();

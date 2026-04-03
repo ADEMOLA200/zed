@@ -7488,6 +7488,7 @@ dependencies = [
  "getrandom 0.3.4",
  "gpui_macros",
  "gpui_platform",
+ "gpui_shared_string",
  "gpui_util",
  "gpui_web",
  "http_client",
@@ -7655,6 +7656,16 @@ dependencies = [
  "gpui_macos",
  "gpui_web",
  "gpui_windows",
+]
+
+[[package]]
+name = "gpui_shared_string"
+version = "0.1.0"
+dependencies = [
+ "derive_more",
+ "gpui_util",
+ "schemars",
+ "serde",
 ]
 
 [[package]]
@@ -9355,9 +9366,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cloud_llm_client",
- "derive_more",
  "futures 0.3.31",
- "gpui_util",
+ "gpui_shared_string",
  "http_client",
  "partial-json-fixer",
  "schemars",

@@ -252,7 +252,7 @@ impl PickerDelegate for ThreadWorktreePickerDelegate {
             });
 
             // Use a foreground spawn to await the background work
-            let linked_worktrees_clone = linked_worktrees.clone();
+            let linked_worktrees_clone = linked_worktrees;
             return cx.spawn_in(_window, async move |picker, cx| {
                 let fuzzy_matches = task.await;
 

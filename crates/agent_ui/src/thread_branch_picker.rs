@@ -343,7 +343,7 @@ impl PickerDelegate for ThreadBranchPickerDelegate {
             .await
         });
 
-        let all_branches_clone = all_branches.clone();
+        let all_branches_clone = all_branches;
         return cx.spawn_in(window, async move |picker, cx| {
             let fuzzy_matches = task.await;
 

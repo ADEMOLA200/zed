@@ -16,8 +16,8 @@ use crate::tasks::compliance::{
 const PULL_REQUEST_BASE_URL: &str = "https://github.com/zed-industries/zed/pull";
 
 #[derive(Debug)]
-struct ReportEntry<R> {
-    commit: CommitDetails,
+pub struct ReportEntry<R> {
+    pub commit: CommitDetails,
     reason: R,
 }
 
@@ -140,6 +140,10 @@ impl Report {
             commit,
             reason: result,
         });
+    }
+
+    pub fn errors(&self) -> impl Iterator<Item = &ReportEntry<ReviewResult>> {
+        self.entries.iter().filter(|entry| entry.reason.is_err())
     }
 
     pub fn summary(&self) -> ReportSummary {

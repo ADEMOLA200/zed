@@ -237,7 +237,15 @@ impl GitHubClient {
         .await
     }
 
-    pub async fn check_org_membership(&mut self, login: &GithubLogin) -> octocrab::Result<bool> {
+    pub async fn add_label_to_pr(&self, label: &str, pr_number: u64) -> octocrab::Result<()> {
+        self.client
+            .issues(ORG, REPO)
+            .add_labels(pr_number, &[label.to_owned()])
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn check_org_membership(&self, login: &GithubLogin) -> octocrab::Result<bool> {
         self.get_all(
             self.client
                 .orgs(ORG)

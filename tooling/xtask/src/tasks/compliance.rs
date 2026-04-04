@@ -15,6 +15,8 @@ mod git;
 mod github;
 mod report;
 
+const PR_REVIEW_LABEL: &str = "PR state:needs review";
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub(crate) enum ReleaseChannel {
     Stable,
@@ -96,9 +98,16 @@ async fn check_compliance_impl(args: ComplianceArgs) -> Result<()> {
 
     println!("Initialized GitHub client for app ID {app_id}");
 
-    let report = Reporter::new(commits, client).generate_report().await?;
+    let report = Reporter::new(commits, &client).generate_report().await?;
 
     let summary = report.summary();
+
+    for report in report.errors() {
+        if let Some(pr_number) = report.commit.pr_number() {
+            client.add_label_to_pr(PR_REVIEW_LABEL, pr_number).await?;
+        }
+    }
+
     let report_path = args.report_path.with_extension("md");
 
     report.write_markdown(&report_path)?;

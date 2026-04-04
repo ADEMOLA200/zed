@@ -96,13 +96,13 @@ impl<E: Into<anyhow::Error>> From<E> for ReviewFailure {
     }
 }
 
-pub(crate) struct Reporter {
+pub(crate) struct Reporter<'a> {
     commits: CommitList,
-    github_client: GitHubClient,
+    github_client: &'a GitHubClient,
 }
 
-impl Reporter {
-    pub fn new(commits: CommitList, github_client: GitHubClient) -> Self {
+impl<'a> Reporter<'a> {
+    pub fn new(commits: CommitList, github_client: &'a GitHubClient) -> Self {
         Self {
             commits,
             github_client,
@@ -214,7 +214,9 @@ impl Reporter {
             let mut org_approving_reviews = Vec::new();
             for review in pr_reviews {
                 if let Some(github_login) = review.user.as_ref()
-                    && dbg!(pull_request.user.as_ref())
+                    && pull_request
+                        .user
+                        .as_ref()
                         .is_none_or(|pr_user| pr_user.login != github_login.login)
                     && review
                         .state
